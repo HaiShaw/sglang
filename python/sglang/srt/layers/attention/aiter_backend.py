@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _AITER_PARTITION_SIZE_ROCM = 256
-_MAX_BATCH_SIZE = 128 # can modify
 
 class AiterAttnBackend(AttentionBackend):
     def __init__(
@@ -86,32 +85,22 @@ class AiterAttnBackend(AttentionBackend):
         
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         
-        # TODO: verify this
         self.q_dtype = model_runner.model_config.dtype
         
         
         #=====================Aiter Decode Initialization===========================
-        max_num_partitions = (
+        self.max_num_partitions = (
                 self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
             ) // _AITER_PARTITION_SIZE_ROCM
         
-        self.exp_sums = torch.empty(
-            size=(_MAX_BATCH_SIZE, self.num_head, max_num_partitions),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
         
-        self.max_logits = torch.empty_like(self.exp_sums)
-        
-        self.tmp_output = torch.empty(
-            size=(_MAX_BATCH_SIZE, self.num_head, max_num_partitions, self.head_dim),
-            dtype= self.q_dtype,
-            device=self.device,
-        )
+        self.workspace_buffer = torch.empty((max_bs * self.num_head * self.max_num_partitions * self.head_dim) * nbyes_per_qo_elem
+                            + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
         
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-        self.kv_last_page_lens = torch.ones((_MAX_BATCH_SIZE, ), dtype=torch.int32).to(self.device)
+        self.kv_last_page_lens = torch.ones((max_bs, ), dtype=torch.int32).to(self.device)
         
         #=======================Aiter Decode Initialization Ends==========================
         
@@ -466,8 +455,6 @@ class AiterAttnBackend(AttentionBackend):
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-        # TODO: reuse the buffer across layers
-        # TODO: q_head_dim and kv_head_dim are always the same within aiter attention
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -480,22 +467,20 @@ class AiterAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-    
+
+        
         self.decode_attention_fwd(
             o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)
-            self.exp_sums, 
-            self.max_logits,
-            self.tmp_output, 
+            self.workspace_buffer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-            layer.tp_k_head_num, 
             self.scale, 
             kv_indptr,
             kv_indices, 
             self.kv_last_page_lens, 
             1, 
-            self.max_context_len, 
+            self.max_num_partitions, 
             None, 
             "auto", 
             "NHD", 
@@ -505,5 +490,6 @@ class AiterAttnBackend(AttentionBackend):
             None, 
             _AITER_PARTITION_SIZE_ROCM 
         )
+        
+        
         return o
-

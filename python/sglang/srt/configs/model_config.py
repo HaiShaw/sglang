@@ -389,6 +389,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
+        or "Qwen2ForRewardModel" in model_architectures
     ):
         return False
     else:
@@ -403,6 +404,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaVidForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "Qwen2_5_VLForConditionalGeneration" in model_architectures
         or "MiniCPMV" in model_architectures
     ):
         return True

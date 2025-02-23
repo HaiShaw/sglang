@@ -37,6 +37,10 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+from sglang.srt.layers.attention.mix_triton_aiter_backend import MixTritonAiterAttnBackend
+from sglang.srt.layers.attention.mix_triton_flashinfer_backend import MixTritonFlashInferAttnBackend
+from sglang.srt.layers.attention.mix_flashinfer_aiter_backend import MixFlashInferAiterAttnBackend
+from sglang.srt.layers.attention.flashinfer_amd_backend import FlashInferAMDAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -691,6 +695,14 @@ class ModelRunner:
             self.attn_backend = FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "aiter":
             self.attn_backend = AiterAttnBackend(self)
+        elif self.server_args.attention_backend == "mix_triton_aiter":
+            self.attn_backend = MixTritonAiterAttnBackend(self)
+        elif self.server_args.attention_backend == "mix_triton_flashinfer":
+            self.attn_backend = MixTritonFlashInferAttnBackend(self)
+        elif self.server_args.attention_backend == "mix_flashinfer_aiter":
+            self.attn_backend = MixFlashInferAiterAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer_amd":
+            self.attn_backend = FlashInferAMDAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "

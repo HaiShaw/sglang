@@ -4,6 +4,7 @@ from __future__ import annotations
 end to end attention solution with aiter kernels
 """
 
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -25,27 +26,22 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
 
-if is_flashinfer_available():
-    from flashinfer import (
-        BatchDecodeWithPagedKVCacheWrapper,
-        BatchPrefillWithPagedKVCacheWrapper,
-    )
-    from flashinfer.decode import PosEncodingMode
+
+
+from flashinfer import (
+    BatchPrefillWithPagedKVCacheWrapper,
+)
     
-from aiter import paged_attention_rocm
+from aiter import paged_attention_rocm # aiter decode kernel
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
 
 @dataclass
-class AiterDecodeMetadata:
+class DecodeMetadata:
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
-
-@dataclass
-class DecodeMetadata:
-    decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
 
 
 @dataclass
@@ -57,11 +53,6 @@ class PrefillMetadata:
 global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
-
-USE_AITER_DECODE_KERNEL = True # force to use decode kernels for decode
-
-# call flashinfer decode wrapper only when USE_AITER_DECODE_KERNEL=False && use_tensor_cores = True
-# or if we want to combine flashinfer decode kernels
 
 class MixFlashInferAiterAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
@@ -92,11 +83,6 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
         
         # Parse constants
         # for grok-1 this will be False
-        self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=self.kv_cache_dtype,
-            num_attention_heads=self.num_head,
-            num_kv_heads=self.num_kv_head,
-        )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
 
@@ -155,7 +141,6 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
-        self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
@@ -168,18 +153,7 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
                 self.prefill_wrappers_verify.append(
                     BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
                 )
-            
-            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
-                self.decode_wrappers.append(
-                    BatchDecodeWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        use_tensor_cores=self.decode_use_tensor_cores,
-                    )
-                )
-                
-        # at this point if self.decode_use_tensor_cores = False or USE_AITER_DECODE_KERNEL = True, self.decode_wrappers = []
-        
+                        
         
 
         # Create indices updater
@@ -188,67 +162,55 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
                 model_runner, self
             )
         
-    
-        if self.decode_use_tensor_cores:
-            self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
-        
         #===========================aiter decode initialization=============================
-        # this is irrelevant to bs
-        if not self.decode_use_tensor_cores or USE_AITER_DECODE_KERNEL:
-            max_num_partitions = (self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1) // _AITER_PARTITION_SIZE_ROCM
-            nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
-            self.aiter_workspace_buffer = torch.empty((max_bs * self.num_head * max_num_partitions * self.head_dim) * nbyes_per_qo_elem
-                                    + 2 * (max_bs * self.num_head * max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
-            self.scale = float(1.0 / (self.head_dim**0.5))
-            self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
+        self.max_num_partitions = (
+                self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+            ) // _AITER_PARTITION_SIZE_ROCM
+        
+        nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
+        
+        self.workspace_buffer = torch.empty((max_bs * self.num_head * self.max_num_partitions * self.head_dim) * nbyes_per_qo_elem
+                            + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
+        
+        self.scale = float(1.0 / (self.head_dim**0.5))
+        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
+        self.kv_last_page_lens = torch.ones((max_bs, ), dtype=torch.int32).to(self.device)
             
         #==========================aiter decode initialization ends==========================
-            
-        # Other metadata
-        # DecodeMetadata can be empty
-        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata, AiterDecodeMetadata] = None
+    
+        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
-            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
-                self.indices_updater_decode.update(
+            # update for aiter
+            # create kv_indices and kv_inptr
+            # shape is defined by current batch
+            bs = forward_batch.batch_size
+            kv_indptr = self.kv_indptr[0] # points to buffer, since self.kv_indices supports 2 wrappers scenario, for aiter decode use kv_indptr[0] as kv_indptr buffer
+            spec_info = forward_batch.spec_info
+            if spec_info is None:
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.zeros(
+                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    decode_wrappers=self.decode_wrappers,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
-                self.forward_metadata = DecodeMetadata(self.decode_wrappers)
             else:
-                # update for aiter
-                # create kv_indices and kv_inptr
-                # shape is defined by current batch
-                bs = forward_batch.batch_size
-                kv_indptr = self.kv_indptr # points to buffer
-                spec_info = forward_batch.spec_info
-                if spec_info is None:
-                    kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
-                    kv_indptr = kv_indptr[: bs + 1]
-                    kv_indices = torch.zeros(
-                        forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
-                    )
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                    )
-                else:
-                    kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-                    bs = kv_indptr.shape[0] - 1
-                self.forward_metadata = AiterDecodeMetadata(kv_indptr, kv_indices)
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                bs = kv_indptr.shape[0] - 1
                 
+            self.forward_metadata = DecodeMetadata(kv_indptr, kv_indices) 
+            
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -310,8 +272,6 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        # create a kv_indices buffer for each wrapper
-        # only cuda graph requires this buffer allocation? 
         self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
             cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
         ]
@@ -336,59 +296,29 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
-            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
-                decode_wrappers = []
-                for i in range(self.num_wrappers):
-                    decode_wrappers.append(
-                        BatchDecodeWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            use_cuda_graph=True,
-                            use_tensor_cores=self.decode_use_tensor_cores,
-                            paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                            paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                            paged_kv_last_page_len_buffer=self.kv_last_page_len[
-                                :num_tokens
-                            ],
-                        )
-                    )
-                seq_lens_sum = seq_lens.sum().item()
-                # update all decode wrappers
-                self.indices_updater_decode.update(
+            bs = len(req_pool_indices)
+            kv_indptr = self.kv_indptr[0] # points to buffer
+
+            if spec_info is None:
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.zeros(
+                    seq_lens_sum, dtype=torch.int32, device=self.device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     req_pool_indices,
                     seq_lens,
-                    seq_lens_sum,
-                    decode_wrappers=decode_wrappers,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
-                # wrappers and data for different bs is stored for cuda graph capture
-                # this will be called before capture cuda graph for one batch size
-                self.decode_cuda_graph_metadata[bs] = decode_wrappers
-                self.forward_metadata = DecodeMetadata(decode_wrappers)
             else:
-                bs = len(req_pool_indices)
-                kv_indptr = self.kv_indptr # points to buffer
-
-                if spec_info is None:
-                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                    kv_indptr = kv_indptr[: bs + 1]
-                    kv_indices = torch.zeros(
-                        seq_lens_sum, dtype=torch.int32, device=self.device
-                    )
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        req_pool_indices,
-                        seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                    )
-                else:
-                    kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-                    bs = kv_indptr.shape[0] - 1
-                self.forward_metadata = AiterDecodeMetadata(kv_indptr, kv_indices)
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                bs = kv_indptr.shape[0] - 1
+            self.forward_metadata = DecodeMetadata(kv_indptr, kv_indices)
+            self.prefill_cuda_graph_metadata[bs] = DecodeMetadata(kv_indptr, kv_indices) # cuda_graph_metadata never used? 
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -430,40 +360,29 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        # this will be called everytime when cuda graph for certain bs is replayed
         if forward_mode.is_decode_or_idle():
-            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
-                self.indices_updater_decode.update(
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    seq_lens_sum,
-                    decode_wrappers=self.decode_cuda_graph_metadata[bs],
-                    encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                    spec_info=spec_info,
+            bs = len(req_pool_indices)
+            kv_indptr = self.kv_indptr[0] # points to buffer
+
+            if spec_info is None:
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.zeros(
+                    seq_lens_sum, dtype=torch.int32, device=self.device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
             else:
-                bs = len(req_pool_indices)
-                kv_indptr = self.kv_indptr # points to buffer
-
-                if spec_info is None:
-                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                    kv_indptr = kv_indptr[: bs + 1]
-                    kv_indices = torch.zeros(
-                        seq_lens_sum, dtype=torch.int32, device=self.device
-                    )
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        req_pool_indices,
-                        seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                    )
-                else:
-                    kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-                    bs = kv_indptr.shape[0] - 1
-                self.forward_metadata = AiterDecodeMetadata(kv_indptr, kv_indices)
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                bs = kv_indptr.shape[0] - 1
+            self.forward_metadata = DecodeMetadata(kv_indptr, kv_indices)
                 
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -545,44 +464,31 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
                     
-        if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
-            decode_wrapper = self.forward_metadata.decode_wrappers[
-                self._get_wrapper_idx(layer)
-            ]
-
-            o = decode_wrapper.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-            )
-        else:
-            # use aiter decode
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
-            paged_attention_rocm(
-                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)
-                self.workspace_buffer,
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                layer.tp_k_head_num, 
-                self.scale, 
-                kv_indptr,
-                kv_indices, 
-                self.kv_last_page_len, 
-                1, 
-                self.max_context_len, 
-                None, 
-                "auto", 
-                "NHD", 
-                layer.logit_cap,
-                self.k_scale,
-                self.v_scale,
-                None, 
-                _AITER_PARTITION_SIZE_ROCM 
+        
+        kv_indptr = self.forward_metadata.kv_indptr
+        kv_indices = self.forward_metadata.kv_indices
+         
+        o = torch.empty_like(q)
+        paged_attention_rocm(
+            o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)
+            self.workspace_buffer,
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            self.scale, 
+            kv_indptr,
+            kv_indices, 
+            self.kv_last_page_lens, 
+            1, 
+            self.max_num_partitions, 
+            None, 
+            "auto", 
+            "NHD", 
+            layer.logit_cap,
+            self.k_scale,
+            self.v_scale,
+            None, 
+            _AITER_PARTITION_SIZE_ROCM 
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -597,174 +503,6 @@ class MixFlashInferAiterAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")    
-    
-class FlashInferIndicesUpdaterDecode:
-    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        # Parse Constants
-        self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
-        )
-        self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
-        self.q_data_type = model_runner.dtype
-        self.sliding_window_size = model_runner.sliding_window_size
-        self.attn_backend = attn_backend
-
-        # Buffers and wrappers
-        self.kv_indptr = attn_backend.kv_indptr
-        self.kv_last_page_len = attn_backend.kv_last_page_len
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
-
-        # Dispatch the update function
-        if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
-            self.update = self.update_sliding_window
-        elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
-            self.update = self.update_cross_attention
-        else:
-            assert self.attn_backend.num_wrappers == 1
-            self.update = self.update_single_wrapper
-
-    def update(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInfo],
-    ):
-        # Keep the signature for type checking. It will be assigned during runtime.
-        raise NotImplementedError()
-
-    def update_single_wrapper(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInfo],
-    ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
-        self.call_begin_forward(
-            decode_wrappers[0],
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            self.kv_indptr[0],
-            None,
-            spec_info,
-        )
-
-    def update_sliding_window(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInfo],
-    ):
-        for wrapper_id in range(2):
-            if wrapper_id == 0:
-                # Sliding window attention
-                paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
-                    seq_lens,
-                    torch.tensor(self.sliding_window_size + 1),
-                )
-                paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
-                kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
-            else:
-                # Full attention
-                paged_kernel_lens_tmp = seq_lens
-                paged_kernel_lens_sum_tmp = seq_lens_sum
-                kv_start_idx_tmp = None
-
-            self.call_begin_forward(
-                decode_wrappers[wrapper_id],
-                req_pool_indices,
-                paged_kernel_lens_tmp,
-                paged_kernel_lens_sum_tmp,
-                self.kv_indptr[wrapper_id],
-                kv_start_idx_tmp,
-                spec_info,
-            )
-
-    def update_cross_attention(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInfo],
-    ):
-        for wrapper_id in range(2):
-            if wrapper_id == 0:
-                # Normal attention
-                paged_kernel_lens = seq_lens
-                kv_start_idx = encoder_lens
-            else:
-                # Cross attention
-                paged_kernel_lens = encoder_lens
-                kv_start_idx = torch.zeros_like(encoder_lens)
-                seq_lens_sum = encoder_lens.sum().item()
-
-            self.call_begin_forward(
-                decode_wrappers[wrapper_id],
-                req_pool_indices,
-                paged_kernel_lens,
-                seq_lens_sum,
-                self.kv_indptr[wrapper_id],
-                kv_start_idx,
-                spec_info,
-            )
-
-    def call_begin_forward(
-        self,
-        wrapper: BatchDecodeWithPagedKVCacheWrapper,
-        req_pool_indices: torch.Tensor,
-        paged_kernel_lens: torch.Tensor,
-        paged_kernel_lens_sum: int,
-        kv_indptr: torch.Tensor,
-        kv_start_idx: torch.Tensor,
-        spec_info: Optional[SpecInfo],
-    ):
-        if spec_info is None:
-            bs = len(req_pool_indices)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
-        else:
-            kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-            bs = kv_indptr.shape[0] - 1
-
-        wrapper.begin_forward(
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            data_type=self.data_type,
-            q_data_type=self.q_data_type,
-            non_blocking=True,
-        )
 
 
 class FlashInferIndicesUpdaterPrefill:
@@ -1005,37 +743,4 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
-
-def should_use_tensor_core(
-    kv_cache_dtype: torch.dtype,
-    num_attention_heads: int,
-    num_kv_heads: int,
-) -> bool:
-    """
-    Determine whether to use tensor cores for attention computation.
-
-    Args:
-        kv_cache_dtype: Data type of the KV cache
-        num_attention_heads: Number of attention heads
-        num_kv_heads: Number of key/value heads
-
-    Returns:
-        bool: Whether to use tensor cores
-    """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
-
-    # Calculate GQA group size
-    gqa_group_size = num_attention_heads // num_kv_heads
-
-    # Determine based on dtype and GQA group size
-    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return True
-    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
-    else:
-        return False
 

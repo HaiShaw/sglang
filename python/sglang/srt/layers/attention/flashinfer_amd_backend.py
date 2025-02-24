@@ -25,11 +25,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
 
-if is_flashinfer_available():
-    from flashinfer import (
-        BatchDecodeWithPagedKVCacheWrapper,
-        BatchPrefillWithPagedKVCacheWrapper,
-    )
+# if is_flashinfer_available():
+from flashinfer import (
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+)
 
 
 class WrapperDispatch(Enum):

@@ -6,7 +6,7 @@ import torch
 import triton
 
 from sglang.srt.layers.attention import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import (
+from sglang.srt.layers.attention.flashinfer_amd_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size

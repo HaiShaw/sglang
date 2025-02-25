@@ -54,7 +54,7 @@ global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
-class MixFlashInferAiterAttnBackend(AttentionBackend):
+class FlashInferAiterAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
     def __init__(

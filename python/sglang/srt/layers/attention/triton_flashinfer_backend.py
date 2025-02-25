@@ -35,7 +35,7 @@ class FlashInferDecodeMetadata:
 
 
 # ATTENTION: This backend mix triton extend and flashinfer decode
-class MixTritonFlashInferAttnBackend(AttentionBackend):
+class TritonFlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         #=========triton extend init==============
         # Lazy import of trition op to avoid the initialization of cuda context

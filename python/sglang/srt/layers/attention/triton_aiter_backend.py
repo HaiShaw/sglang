@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
-class MixTritonAiterAttnBackend(AttentionBackend):
+class TritonAiterAttnBackend(AttentionBackend):
     def __init__(
         self,
         model_runner: ModelRunner,

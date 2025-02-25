@@ -1,0 +1,146 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index 20261558..774e8ee3 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -554,6 +554,18 @@ class Fp8MoEMethod:
+ 
+                 layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
+                 layer.register_parameter("w2_weight_scale1", w2_weight_scale1)
++
++                # TODO (INT4-FP8)
++                # temp hack for kernel bug, add a smooth quant buffer
++                fc13_smooth_scale = torch.nn.Parameter(
++                    torch.ones(num_experts, hidden_size, dtype=torch.float32), requires_grad=False
++                )
++                fc2_smooth_scale = torch.nn.Parameter(
++                    torch.ones(num_experts, intermediate_size, dtype=torch.float32), requires_grad=False
++                )
++
++                layer.register_parameter("fc13_smooth_scale", fc13_smooth_scale)
++                layer.register_parameter("fc2_smooth_scale", fc2_smooth_scale)
+         # Add the quantization method used (per tensor/grouped/channel)
+         # to ensure the weight scales are loaded in properly
+         extra_weight_attrs.update(
+@@ -574,6 +586,9 @@ class Fp8MoEMethod:
+                 )
+                 set_weight_attrs(w13_weight_scale1, extra_weight_attrs)
+                 set_weight_attrs(w2_weight_scale1, extra_weight_attrs)
++                # TODO (INT4-FP8) tmp hack
++                set_weight_attrs(fc13_smooth_scale, extra_weight_attrs)
++                set_weight_attrs(fc2_smooth_scale, extra_weight_attrs)
+ 
+         # INPUT_SCALES
+         if self.quant_config.activation_scheme == "static":
+@@ -613,6 +628,42 @@ class Fp8MoEMethod:
+                     requires_grad=False,
+                 )
+                 torch.cuda.empty_cache()
++
++            # TODO (INT4-FP8): offset INT4 w13_weight_scale1 to single w13_weight_scale
++            # Fp8 moe kernel needs single fp8 w13_weight_scale for w13 per expert.
++            # We won't do requant each expert's fp8 weight (not direct available),
++            # instead we adjust half of INT4 w13_weight_scale1 numbers
++            assert layer.w13_weight_scale is not None
++            shard_size = layer.intermediate_size_per_partition
++            max_w13_scales = layer.w13_weight_scale.max(dim=1).values
++            # print("w13_weight_scale = ", layer.w13_weight_scale)
++            # print("w13_weight_scale.shape = ", layer.w13_weight_scale.shape)
++            # print("w13_weight_scale1 = ", layer.w13_weight_scale1)
++            # print("w13_weight_scale1.shape = ", layer.w13_weight_scale1.shape)
++            for expert_id in range(layer.num_experts):
++                start = 0
++                max_w13_scale_fp8 = max_w13_scales[expert_id]
++                for shard_id in range(2):
++                    if layer.w13_weight_scale[expert_id][shard_id] != max_w13_scale_fp8:
++                        int4_rescale = layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
++                        layer.w13_weight_scale1[expert_id][start : start + shard_size] *= int4_rescale
++                    start += shard_size
++
++            layer.w13_weight_scale = torch.nn.Parameter(
++                max_w13_scales, requires_grad=False
++            )
++
++            # special hack to asm_moe, which takes (weight_scale1 * weight_scale) as post GEMM scaling
++            # optimal design - shall apply per-column weight_scale1 before GEMM, and weight_scale post
++            # print("max_w13_scales = ", max_w13_scales)
++            # print("w2_weight_scale = ", layer.w2_weight_scale)
++            # print("w13_weight_scale1 = ", layer.w13_weight_scale1)
++            # print("w2_weight_scale1 = ", layer.w2_weight_scale1)
++            for expert_id in range(layer.num_experts):
++                layer.w13_weight_scale1[expert_id] *= max_w13_scales[expert_id]
++                layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
++            # print("w13_weight_scale1 = ", layer.w13_weight_scale1)
++            # print("w2_weight_scale1 = ", layer.w2_weight_scale1)
+             return
+         else:
+             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+@@ -832,31 +883,47 @@ class Fp8MoEMethod:
+         )
+ 
+         if is_hip_ and get_bool_env_var("CK_MOE"):
+-            import ater
+-            from ater.fused_moe import fused_experts_ck
++            import aiter
++            from aiter.fused_moe_bf16_asm import asm_moe
++            #from ater.fused_moe import fused_experts_ck
+ 
+             # TODO (INT4-FP8)
++            # Missing per-Tensor bf16/fp8 scales to GEMM
+             if get_bool_env_var("USE_INT4_WEIGHT"):
+-                return fused_experts_ck(
+-                    x,
+-                    layer.w13_weight,
+-                    layer.w2_weight,
+-                    topk_weights=topk_weights,
+-                    topk_ids=topk_ids,
+-                    use_fp8_w8a8=True,
+-                    w1_scale=(
+-                        layer.w13_weight_scale_inv
+-                        if self.block_quant
+-                        else layer.w13_weight_scale
+-                    ),
+-                    w2_scale=(
+-                        layer.w2_weight_scale_inv
+-                        if self.block_quant
+-                        else layer.w2_weight_scale
+-                    ),
+-                    a1_scale=layer.w13_input_scale,
+-                    a2_scale=layer.w2_input_scale,
+-                )
++                # print("layer.w13_weight.shape = ", layer.w13_weight.shape)
++                # print("layer.w2_weight.shape = ", layer.w2_weight.shape)
++                return asm_moe(
++                        x,
++                        layer.w13_weight,
++                        layer.w2_weight,
++                        topk_weights,
++                        topk_ids,
++                        layer.w13_weight_scale1,
++                        layer.w2_weight_scale1,
++                        layer.fc13_smooth_scale,
++                        layer.fc2_smooth_scale,
++                        False)
++
++                # return fused_experts_ck(
++                #     x,
++                #     layer.w13_weight,
++                #     layer.w2_weight,
++                #     topk_weights=topk_weights,
++                #     topk_ids=topk_ids,
++                #     use_fp8_w8a8=True,
++                #     w1_scale=(
++                #         layer.w13_weight_scale_inv
++                #         if self.block_quant
++                #         else layer.w13_weight_scale
++                #     ),
++                #     w2_scale=(
++                #         layer.w2_weight_scale_inv
++                #         if self.block_quant
++                #         else layer.w2_weight_scale
++                #     ),
++                #     a1_scale=layer.w13_input_scale,
++                #     a2_scale=layer.w2_input_scale,
++                # )
+ 
+         else:
+             # Expert fusion with FP8 quantization

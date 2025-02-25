@@ -278,7 +278,6 @@ class MixTritonAiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-
             # attn_logits = self.cuda_graph_attn_logits
             attn_logits = None
             max_extend_len = None
@@ -466,8 +465,7 @@ class MixTritonAiterAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-
-
+        
         
         self.decode_attention_fwd(
             o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)

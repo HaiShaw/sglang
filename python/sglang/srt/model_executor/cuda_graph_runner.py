@@ -380,7 +380,6 @@ class CudaGraphRunner:
         def run_once():
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
             return logits_output.next_token_logits, logits_output.hidden_states
-
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
@@ -399,7 +398,6 @@ class CudaGraphRunner:
 
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
-
         global_graph_memory_pool = graph.pool()
         return graph, out
 

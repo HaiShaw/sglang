@@ -6,7 +6,7 @@ response = requests.post(
         "text": "List 10 countries and their capitals.",
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 1024,
+            "max_new_tokens": 32,
         },
     },
 )

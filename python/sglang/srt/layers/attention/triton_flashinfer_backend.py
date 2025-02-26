@@ -8,7 +8,7 @@ import triton.language as tl
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -29,8 +29,17 @@ from flashinfer import (
 class DecodeMetadata:
     decode_wrapper: BatchDecodeWithPagedKVCacheWrapper
     
+@dataclass
+class PrefillMetadata:
+    max_extend_len: int
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    qo_indptr: torch.Tensor
+    custom_mask: torch.Tensor
+    mask_indptr: torch.Tensor
+    
 
-class TritonAttnBackend(AttentionBackend):
+class TritonFlashInferAttnBackend(AttentionBackend):
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -77,7 +86,7 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
-        self.forward_metadata = None
+        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.max_context_len = model_runner.model_config.context_len
 
@@ -123,11 +132,8 @@ class TritonAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             
-            decode_metadata = DecodeMetadata(self.decode_wrapper)
-            qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
-            max_extend_len = None
+            self.forward_metadata = DecodeMetadata(self.decode_wrapper)
+
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
@@ -161,7 +167,8 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
-            decode_metadata = None
+            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
+
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -172,7 +179,8 @@ class TritonAttnBackend(AttentionBackend):
             )
             mask_indptr = None
             max_extend_len = torch.max(spec_info.accept_length).item()
-            decode_metadata = None
+            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
+
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
@@ -198,18 +206,9 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
             mask_indptr = None
-            decode_metadata = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
 
-        self.forward_metadata = (
-            decode_metadata,
-            max_extend_len,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-        )
 
     def init_cuda_graph_state(
         self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
@@ -262,11 +261,7 @@ class TritonAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
-            decode_metadata = DecodeMetadata(decode_wrapper)
-            max_extend_len = None
-            qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
+            self.forward_metadata = DecodeMetadata(decode_wrapper)
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -294,21 +289,11 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
             max_extend_len = self.num_draft_tokens
-            decode_metadata = None
+            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
             )
-
-        self.forward_metadata = (
-            decode_metadata,
-            max_extend_len,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -386,9 +371,7 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        (
-            _,
-            max_extend_len,
+        (   max_extend_len,
             kv_indptr,
             kv_indices,
             qo_indptr,
@@ -423,7 +406,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata[0].decode_wrapper
+        decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -468,13 +451,15 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        
+        self.update = self.update_single_wrapper
 
     def update(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
+        decode_wrapper: BatchDecodeWithPagedKVCacheWrapper,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):

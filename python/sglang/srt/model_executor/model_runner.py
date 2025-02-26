@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.triton_aiter_backend import TritonAiterAttnBackend
+from sglang.srt.layers.attention.triton_flashinfer_backend import TritonFlashInferAttnBackend
 from sglang.srt.layers.attention.flashinfer_aiter_backend import FlashInferAiterAttnBackend
 from sglang.srt.layers.attention.flashinfer_amd_backend import FlashInferAMDAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -695,6 +696,8 @@ class ModelRunner:
             self.attn_backend = FlashInferAMDAttnBackend(self)
         elif self.server_args.attention_backend == "triton_aiter":
             self.attn_backend = TritonAiterAttnBackend(self)
+        elif self.server_args.attention_backend == "triton_flashinfer":
+            self.attn_backend = TritonFlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer_aiter":
             self.attn_backend = FlashInferAiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":

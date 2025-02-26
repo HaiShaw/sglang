@@ -29,15 +29,7 @@ from flashinfer import (
 class DecodeMetadata:
     decode_wrapper: BatchDecodeWithPagedKVCacheWrapper
     
-@dataclass
-class PrefillMetadata:
-    max_extend_len: int
-    kv_indptr: torch.Tensor
-    kv_indices: torch.Tensor
-    qo_indptr: torch.Tensor
-    custom_mask: torch.Tensor
-    mask_indptr: torch.Tensor
-    
+
 
 class TritonFlashInferAttnBackend(AttentionBackend):
     def __init__(
@@ -86,7 +78,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
         self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
-        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.forward_metadata = None
 
         self.max_context_len = model_runner.model_config.context_len
 
@@ -167,7 +159,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
-            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
+            self.forward_metadata = (max_extend_len, kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
 
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
@@ -179,7 +171,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
             )
             mask_indptr = None
             max_extend_len = torch.max(spec_info.accept_length).item()
-            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
+            self.forward_metadata = (max_extend_len, kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
 
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
@@ -207,7 +199,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
-            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
+            self.forward_metadata = (max_extend_len, kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
 
 
     def init_cuda_graph_state(
@@ -262,6 +254,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
             self.forward_metadata = DecodeMetadata(decode_wrapper)
+            
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -289,7 +282,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
             max_extend_len = self.num_draft_tokens
-            self.forward_metadata = PrefillMetadata(max_extend_len,kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
+            self.forward_metadata = (max_extend_len, kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr)
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
@@ -311,7 +304,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                decode_wrapper=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
@@ -371,13 +364,7 @@ class TritonFlashInferAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        (   max_extend_len,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-        ) = self.forward_metadata
+        max_extend_len, kv_indptr, kv_indices, qo_indptr, custom_mask, mask_indptr = self.forward_metadata
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

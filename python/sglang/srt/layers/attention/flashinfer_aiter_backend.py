@@ -34,9 +34,6 @@ from flashinfer import (
     
 from aiter import paged_attention_rocm # aiter decode kernel
 
-class WrapperDispatch(Enum):
-    SLIDING_WINDOW = auto()
-    CROSS_ATTENTION = auto()
 
 @dataclass
 class DecodeMetadata:
@@ -89,6 +86,8 @@ class FlashInferAiterAttnBackend(AttentionBackend):
         # Qwen2 models require higher flashinfer workspace size
         if "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures:
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
+            
+        global_config.flashinfer_workspace_size = 2048 * 1024 * 1024
 
         # Allocate buffers for prefill kernels
         global global_workspace_buffer
@@ -186,7 +185,7 @@ class FlashInferAiterAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, False, False
+                self.prefill_wrapper_paged, False
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -199,7 +198,7 @@ class FlashInferAiterAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_verify, False, False
+                self.prefill_wrapper_verify, False
             )
         else:
             # extend
@@ -311,8 +310,10 @@ class FlashInferAiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
-            kv_indptr = self.kv_indptr # points to buffer
-            kv_indices = self.cuda_graph_kv_indices
+            kv_indptr = self.decode_cuda_graph_metadata[bs].kv_indptr
+            kv_indices = self.decode_cuda_graph_metadata[bs].kv_indices
+            # kv_indptr = self.kv_indptr # points to buffer
+            # kv_indices = self.cuda_graph_kv_indices
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
@@ -354,6 +355,7 @@ class FlashInferAiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
         cache_loc = (
             forward_batch.out_cache_loc
@@ -362,20 +364,19 @@ class FlashInferAiterAttnBackend(AttentionBackend):
         )
 
         logits_soft_cap = layer.logit_cap
-
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-
+        
         o = prefill_wrapper_paged.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             causal=not layer.is_cross_attention,
             sm_scale=layer.scaling,
-            window_left=layer.sliding_window_size,
+            window_left=layer.sliding_window_size, # -1 -> no window, None
             logits_soft_cap=logits_soft_cap,
             k_scale=layer.k_scale,
             v_scale=layer.v_scale,
@@ -446,7 +447,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
-
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len

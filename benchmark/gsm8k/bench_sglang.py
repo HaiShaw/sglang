@@ -65,7 +65,10 @@ def main(args):
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
+    
+    
 
+    question_index = 0
     #####################################
     ######### SGL Program Begin #########
     #####################################
@@ -74,6 +77,7 @@ def main(args):
 
     @sgl.function
     def few_shot_gsm8k(s, question):
+        # print(question)
         s += few_shot_examples + question
         s += sgl.gen(
             "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
@@ -102,7 +106,19 @@ def main(args):
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
+    # print("client side output shape: ", (np.array(preds)).shape)
     invalid = np.mean(np.array(preds) == INVALID)
+    # for i in range(10):
+    #     print("pred: {}".format(preds[i]))
+    #     print("label: {}".format(labels[i]))
+    #     if (preds[i] != labels[i]):
+    #         print("wrong answer!")
+    
+    # for i in range(10):
+    #     if preds[i] == labels[i]:
+    #         print("for question {} the output is correct".format(i))
+    #     else:
+    #         print("for question {} the output is wrong".format(i))
 
     # Compute speed
     num_output_tokens = sum(

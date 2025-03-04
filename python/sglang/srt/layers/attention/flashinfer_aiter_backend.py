@@ -240,6 +240,8 @@ class FlashInferAiterAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
+            self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
+            self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def init_forward_metadata_capture_cuda_graph(
         self,

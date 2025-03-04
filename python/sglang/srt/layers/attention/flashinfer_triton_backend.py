@@ -100,7 +100,6 @@ class FlashInferTritonAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
-        
         self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
         
@@ -119,7 +118,7 @@ class FlashInferTritonAttnBackend(AttentionBackend):
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
 
         self.prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD", backend="fa2")
-        self.prefill_wrapper_verify = BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+        self.prefill_wrapper_verify = BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD", backend="fa2")
         
         self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         
@@ -288,6 +287,7 @@ class FlashInferTritonAttnBackend(AttentionBackend):
                 paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                 custom_mask_buf=self.cuda_graph_custom_mask,
                 mask_indptr_buf=self.cuda_graph_qk_indptr[: bs + 1],
+                backend="fa2"
             )
                 
             seq_lens_sum = seq_lens.sum().item()
@@ -361,7 +361,7 @@ class FlashInferTritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        
+        # print("layer id: {}".format(layer.layer_id))
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
         cache_loc = (
             forward_batch.out_cache_loc
@@ -376,7 +376,10 @@ class FlashInferTritonAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-        
+       
+        # with open('/tmp/sglang.log', 'a') as log:
+        #     local_q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        #     print(f'[POYENC] {layer.layer_id=} {local_q.shape=} {local_q.device=}', file=log) 
         o = prefill_wrapper_paged.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -387,7 +390,11 @@ class FlashInferTritonAttnBackend(AttentionBackend):
             k_scale=layer.k_scale,
             v_scale=layer.v_scale,
         )
-
+        if layer.layer_id < 10:
+            torch.save(q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                f'/tmp/dump/layer-{layer.layer_id}-device-{q.device.index}-q.pt')
+            torch.save(o.view(-1, layer.tp_q_head_num * layer.head_dim),
+                f'/tmp/dump/layer-{layer.layer_id}-device-{q.device.index}-o.pt')
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

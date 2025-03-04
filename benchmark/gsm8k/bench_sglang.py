@@ -108,17 +108,12 @@ def main(args):
     acc = np.mean(np.array(preds) == np.array(labels))
     # print("client side output shape: ", (np.array(preds)).shape)
     invalid = np.mean(np.array(preds) == INVALID)
-    # for i in range(10):
-    #     print("pred: {}".format(preds[i]))
-    #     print("label: {}".format(labels[i]))
-    #     if (preds[i] != labels[i]):
-    #         print("wrong answer!")
+    for i in range(min(10, args.num_questions)):
+        print("pred: {}".format(preds[i]))
+        print("label: {}".format(labels[i]))
+        if (preds[i] != labels[i]):
+            print("wrong answer!")
     
-    # for i in range(10):
-    #     if preds[i] == labels[i]:
-    #         print("for question {} the output is correct".format(i))
-    #     else:
-    #         print("for question {} the output is wrong".format(i))
 
     # Compute speed
     num_output_tokens = sum(

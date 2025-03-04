@@ -117,6 +117,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
+            
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(

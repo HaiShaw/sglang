@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.triton_flashinfer_backend import TritonFlashInferAttnBackend
 
 if is_hip():
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -805,6 +806,8 @@ class ModelRunner:
                 self.attn_backend = AiterAttnBackend(self)
             elif self.server_args.attention_backend == "aiter_decode":
                 self.attn_backend = AiterDecodeAttnBackend(self)
+            elif self.server_args.attention_backend == "triton_flashinfer":
+                self.attn_backend = TritonFlashInferAttnBackend(self)
             elif self.server_args.attention_backend == "triton":
                 assert self.sliding_window_size is None, (
                     "Window attention is not supported in the triton attention backend. "

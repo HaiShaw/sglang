@@ -89,8 +89,6 @@ class FlashInferTritonAttnBackend(AttentionBackend):
         # Qwen2 models require higher flashinfer workspace size
         if "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures:
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
-            
-        global_config.flashinfer_workspace_size = 2048 * 1024 * 1024
 
         # Allocate buffers for prefill kernels
         global global_workspace_buffer
@@ -131,6 +129,8 @@ class FlashInferTritonAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}
+        
+        self.logits_soft_cap = 0.0
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -407,6 +407,7 @@ class FlashInferTritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        self.logits_soft_cap = layer.logit_cap
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -434,7 +435,7 @@ class FlashInferTritonAttnBackend(AttentionBackend):
             self.forward_metadata.attn_logits,
             self.num_kv_splits,
             layer.scaling,
-            layer.logit_cap,
+            self.logits_soft_cap,
         )
         return o
 
@@ -559,6 +560,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             custom_mask=custom_mask,
             non_blocking=True,
+            logits_soft_cap=self.attn_backend.logits_soft_cap
         )
 
 @triton.jit

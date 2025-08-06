@@ -122,15 +122,16 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not x.is_contiguous():
-            # NOTE: Remove this if aiter kernel supports discontinuous input
-            x = x.contiguous()
-        if residual is not None:
-            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = torch.empty_like(x)
-        rms_norm(out, x, self.weight.data, self.variance_epsilon)
-        return out
+        #if not x.is_contiguous():
+        #    # NOTE: Remove this if aiter kernel supports discontinuous input
+        #    x = x.contiguous()
+        #if residual is not None:
+        #    fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+        #    return x, residual
+        #out = torch.empty_like(x)
+        #rms_norm(out, x, self.weight.data, self.variance_epsilon)
+        return self.forward_native(x, residual)
+        #return out
 
     def forward_native(
         self,

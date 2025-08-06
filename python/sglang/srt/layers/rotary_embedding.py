@@ -232,15 +232,16 @@ class RotaryEmbedding(CustomOp):
                 is_neox=self.is_neox_style,
             )
         else:
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.vllm_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+            self.forward_native(positions, query, key, offsets)
+            #self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            #self.vllm_rotary_embedding(
+            #    positions,
+            #    query,
+            #    key,
+            #    self.head_size,
+            #    self.cos_sin_cache,
+            #    self.is_neox_style,
+            #)
         return query, key
 
     def extra_repr(self) -> str:

@@ -126,8 +126,6 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      apt update && apt install -y zip unzip wget && \
      apt install -y gcc make libtool autoconf  librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool  libibverbs-dev rdma-core && \
      apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
-     wget https://dl.google.com/go/go1.24.3.linux-amd64.tar.gz && \
-     rm -rf /usr/local/go && tar -C /usr/local -xzf go1.24.3.linux-amd64.tar.gz && \
      git clone ${MOONCAKE_REPO} && \
      cd Mooncake && \
      git checkout ${MOONCAKE_COMMIT} && \

@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
+    get_global_dp_buffer,
     set_dp_buffer_len,
 )
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding

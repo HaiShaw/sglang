@@ -406,7 +406,7 @@ class CommunicateSimpleFn:
         context: CommunicateContext,
     ) -> torch.Tensor:
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -495,7 +495,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                get_local_dp_buffer(),
+                torch.empty_like(
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]]
+                ),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -509,7 +511,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual = hidden_states
                 hidden_states = layernorm(hidden_states)
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
+                torch.empty_like(forward_batch.gathered_buffer),
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
@@ -633,7 +635,7 @@ class CommunicateSummableTensorPairFn:
         allow_reduce_scatter: bool = False,
     ):
         hidden_states, global_hidden_states = (
-            get_local_dp_buffer(),
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
@@ -654,7 +656,7 @@ class CommunicateSummableTensorPairFn:
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(

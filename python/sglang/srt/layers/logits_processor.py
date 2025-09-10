@@ -113,6 +113,9 @@ class LogitsMetadata:
     dp_local_start_pos: Optional[torch.Tensor] = None
     dp_local_num_tokens: Optional[torch.Tensor] = None
     global_dp_buffer_len: Optional[int] = None
+    gathered_buffer: Optional[torch.Tensor] = None
+    # Buffer to gather logits from all ranks.
+    forward_batch_gathered_buffer: Optional[torch.Tensor] = None
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -167,6 +170,8 @@ class LogitsMetadata:
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
+            gathered_buffer=forward_batch.gathered_buffer,
+            forward_batch_gathered_buffer=forward_batch.gathered_buffer,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
@@ -189,15 +194,16 @@ class LogitsMetadata:
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            self.gathered_buffer = torch.empty(
+                (
+                    sum(self.global_num_tokens_for_logprob_cpu),
+                    self.gathered_buffer.shape[1],
+                ),
+                dtype=self.gathered_buffer.dtype,
+                device=self.gathered_buffer.device,
+            )
         else:
-            self.global_dp_buffer_len = self.global_dp_buffer_len
-
-        set_dp_buffer_len(
-            self.global_dp_buffer_len,
-            self.dp_local_num_tokens,
-            self.global_num_tokens_for_logprob_cpu,
-        )
+            self.gathered_buffer = torch.empty_like(self.gathered_buffer)
 
 
 class LogitsProcessor(nn.Module):
@@ -443,7 +449,7 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
+                logits_metadata.gathered_buffer,
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)

@@ -359,15 +359,30 @@ class CudaGraphRunner:
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_num_token * self.dp_size,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
                 else:
                     assert self.require_attn_tp_gather
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_num_token,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
             else:
                 self.global_num_tokens_gpu = None
                 self.global_num_tokens_for_logprob_gpu = None
+                self.gathered_buffer = None
 
             self.custom_mask = torch.ones(
                 (
@@ -563,6 +578,7 @@ class CudaGraphRunner:
                 )
             )
             global_dp_buffer_len = num_tokens * self.dp_size
+            gathered_buffer = self.gathered_buffer[: num_tokens * self.dp_size]
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -579,8 +595,10 @@ class CudaGraphRunner:
                 )
             )
             global_dp_buffer_len = num_tokens
+            gathered_buffer = self.gathered_buffer[:num_tokens]
         else:
             global_dp_buffer_len = None
+            gathered_buffer = None
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -615,6 +633,7 @@ class CudaGraphRunner:
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
+            gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -643,7 +662,7 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            #set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             kwargs = {}
             if (

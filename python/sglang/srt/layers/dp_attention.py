@@ -93,7 +93,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        return torch.empty(
+        return torch.zeros(
             (cls._global_dp_buffer_len, cls._hidden_size),
             dtype=cls._dtype,
             device=cls._device,
@@ -101,7 +101,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
-        return torch.empty(
+        return torch.zeros(
             (cls._local_dp_buffer_len, cls._hidden_size),
             dtype=cls._dtype,
             device=cls._device,

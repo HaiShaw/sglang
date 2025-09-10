@@ -288,6 +288,7 @@ class ForwardBatch:
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    gathered_buffer: Optional[torch.Tensor] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -707,6 +708,7 @@ class ForwardBatch:
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        self.gathered_buffer = get_global_dp_buffer()
 
         bs = self.batch_size
 

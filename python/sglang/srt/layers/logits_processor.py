@@ -114,8 +114,6 @@ class LogitsMetadata:
     dp_local_num_tokens: Optional[torch.Tensor] = None
     global_dp_buffer_len: Optional[int] = None
     gathered_buffer: Optional[torch.Tensor] = None
-    # Buffer to gather logits from all ranks.
-    forward_batch_gathered_buffer: Optional[torch.Tensor] = None
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -171,7 +169,6 @@ class LogitsMetadata:
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             gathered_buffer=forward_batch.gathered_buffer,
-            forward_batch_gathered_buffer=forward_batch.gathered_buffer,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,

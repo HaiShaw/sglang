@@ -2973,7 +2973,7 @@ class ServerArgs:
                 self.attention_backend = "nsa"
                 logger.warning("Set nsa attention backend for DeepSeek NSA.")
 
-            if not is_npu():
+            if is_cuda():
                 self.enable_dp_attention = True
                 self.dp_size = self.tp_size
                 logger.warning("DP attention is enabled for DeepSeek NSA.")
@@ -3000,6 +3000,15 @@ class ServerArgs:
                     logger.warning(
                         "Setting NSA backend to flashmla_decode for FP8 KV Cache."
                     )
+
+            elif is_hip():
+                self.page_size = 64
+                logger.warning("Setting page size to 64 for DeepSeek NSA.")
+
+                self.max_prefill_bs = 1
+                logger.warning(
+                    "Setting maximum prefill batch size to 1 for DeepSeek NSA."
+                )
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)

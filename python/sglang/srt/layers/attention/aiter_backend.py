@@ -359,6 +359,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_partial_map,
                     ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
 
+                    num_kv_splits, num_kv_splits_indptr = self.make_split_kv_buffer(bs)
+
                     meta = get_mla_metadata_v1(
                         qo_indptr,
                         kv_indptr,
@@ -374,7 +376,9 @@ class AiterAttnBackend(AttentionBackend):
                         kv_granularity=max(page_size, 16),
                         max_seqlen_qo=max_seqlen_qo,
                         uni_seqlen_qo=max_seqlen_qo,
-                        fast_mode=True,
+                        fast_mode=False,
+                        max_split_per_batch=num_kv_splits,
+                        intera_batch_mode=True,
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -391,6 +395,8 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -456,6 +462,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_partial_map,
                     ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
 
+                    num_kv_splits, num_kv_splits_indptr = self.make_split_kv_buffer(bs)
+
                     meta = get_mla_metadata_v1(
                         qo_indptr,
                         kv_indptr,
@@ -471,7 +479,9 @@ class AiterAttnBackend(AttentionBackend):
                         kv_granularity=max(page_size, 16),
                         max_seqlen_qo=max_seqlen_qo,
                         uni_seqlen_qo=max_seqlen_qo,
-                        fast_mode=True,
+                        fast_mode=False,
+                        max_split_per_batch=num_kv_splits,
+                        intera_batch_mode=True,
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -488,6 +498,8 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -1319,7 +1331,7 @@ class AiterAttnBackend(AttentionBackend):
             nhead_kv = 1
             page_size = 1
 
-            if layer.layer_id == 0:
+            if layer.layer_id == 0 and _use_mla_ps_kernel:
                 meta = get_mla_metadata_v1(
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,

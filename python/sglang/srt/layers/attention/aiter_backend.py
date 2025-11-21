@@ -177,7 +177,9 @@ class AiterAttnBackend(AttentionBackend):
             self.enable_dp_attention = is_dp_attention_enabled()
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = 16
+        nhead = self.num_head
+        dtype = self.kv_cache_dtype
+
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -189,8 +191,8 @@ class AiterAttnBackend(AttentionBackend):
             batch_size,
             max_seqlen_qo,
             nhead,
-            fp8_dtype,
-            fp8_dtype,
+            dtype,
+            dtype,
             is_sparse=False,
             fast_mode=True,
             intra_batch_mode=True,
@@ -216,33 +218,6 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = torch.empty(
             reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
         )
-        #gpu = torch.cuda.current_device()
-        #device_properties = torch.cuda.get_device_properties(gpu)
-        #cu_num = device_properties.multi_processor_count
-
-        #nhead = self.num_head
-
-        #max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * nhead / 128))
-
-        #work_metadata = torch.empty([10], dtype=torch.uint64, device="cuda")
-        #work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
-        #work_info_set = torch.empty(
-        #    [batch_size * max_qo_tiles_per_batch * cu_num, 8],
-        #    dtype=torch.int32,
-        #    device="cuda",
-        #).fill_(-1)
-
-        #reduce_indptr = torch.empty(
-        #    [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
-        #)
-        #reduce_final_map = torch.empty(
-        #    [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
-        #)
-        #reduce_partial_map = torch.empty(
-        #    [batch_size * max_qo_tiles_per_batch * cu_num],
-        #    dtype=torch.int32,
-        #    device="cuda",
-        #)
 
         return (
             work_metadata,

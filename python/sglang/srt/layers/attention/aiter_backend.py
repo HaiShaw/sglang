@@ -1126,7 +1126,7 @@ class AiterAttnBackend(AttentionBackend):
                 nhead_kv = 1
                 page_size = 1
 
-                if layer.layer_id == 0:
+                if layer.layer_id == 0 and _use_mla_ps_kernel:
                     meta = get_mla_metadata_v1(
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,
@@ -1199,7 +1199,7 @@ class AiterAttnBackend(AttentionBackend):
                 nhead_kv = 1
                 page_size = 1
 
-                if layer.layer_id == 0:
+                if layer.layer_id == 0 and _use_mla_ps_kernel:
                     meta = get_mla_metadata_v1(
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,

@@ -228,47 +228,13 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map,
         )
 
-    @functools.lru_cache(maxsize=1)
-    def get_meta_param(self, num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
-        if num_kv_splits is None:
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            avg_kv = total_kv / bs
-            overhead = 84.1
-            tmp = [
-                (
-                    bs
-                    * i
-                    / ((bs * i + cu_num - 1) // cu_num * cu_num)
-                    * avg_kv
-                    / (avg_kv + overhead * i),
-                    i,
-                )
-                for i in range(1, 17)
-            ]
-            num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
-            num_kv_splits = min(num_kv_splits, (total_kv + 15) // 16)
-
-        get_block_n_fp8 = {
-            16: 128,
-            32: 128,
-            48: 64,
-            64: 64,
-            128: 32,
-            256: 32,
-            384: 32,
-            512: 32,
-        }
-        #if dtype == fp8_dtype:
-        #    min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
-        #    num_kv_splits = min(
-        #        num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
-        #    )
+    def make_split_kv_buffer(self, bs):
+        num_kv_splits = 32
 
         num_kv_splits_indptr = torch.arange(
             0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
         )
+
         return num_kv_splits, num_kv_splits_indptr
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -354,11 +320,7 @@ class AiterAttnBackend(AttentionBackend):
                         #    None, bs, kv_indptr[-1].item(), self.num_head, max_q_len, self.kv_cache_dtype
                         #)
 
-                        num_kv_splits = 16
-
-                        num_kv_splits_indptr = torch.arange(
-                            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
-                        )
+                        num_kv_splits, num_kv_splits_indptr = self.make_split_kv_buffer(bs)
 
                         meta = get_mla_metadata_v1(
                             qo_indptr,
@@ -743,11 +705,7 @@ class AiterAttnBackend(AttentionBackend):
                         #    None, bs, kv_indptr[-1].item(), self.num_head, max_q_len, self.kv_cache_dtype
                         #)
 
-                        num_kv_splits = 16
-
-                        num_kv_splits_indptr = torch.arange(
-                            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
-                        )
+                        num_kv_splits, num_kv_splits_indptr = self.make_split_kv_buffer(bs)
 
                         meta = get_mla_metadata_v1(
                             qo_indptr,
@@ -844,13 +802,8 @@ class AiterAttnBackend(AttentionBackend):
                         )
 
                     else:
-                        num_kv_splits = 16
-
-                        num_kv_splits_indptr = torch.arange(
-                            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
-                        )
-
-
+                        num_kv_splits, num_kv_splits_indptr = self.make_split_kv_buffer(bs)
+                        
                         meta = get_mla_metadata_v1(
                             qo_indptr,
                             kv_indptr,
@@ -962,11 +915,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                 else:
-                    num_kv_splits = 16
-
-                    num_kv_splits_indptr = torch.arange(
-                        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
-                    )
+                    num_kv_splits, num_kv_splits_indptr = self.make_split_kv_buffer(bs)
 
                     meta = get_mla_metadata_v1(
                         qo_indptr,

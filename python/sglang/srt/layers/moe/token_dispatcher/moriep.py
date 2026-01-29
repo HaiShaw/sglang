@@ -24,6 +24,7 @@ from enum import Enum, auto
 from functools import lru_cache
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -41,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 class MoriEPNormalDispatchOutput(NamedTuple):
-    """Mori EP dispatch output."""
+    """Mori EP normal dispatch output."""
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -54,7 +55,22 @@ class MoriEPNormalDispatchOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_NORMAL
 
 
+class MoriEPLLDispatchOutput(NamedTuple):
+    """Mori EP low latency dispatch output."""
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    num_recv_tokens_per_expert: List[int]
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_LL
+
 assert isinstance(MoriEPNormalDispatchOutput, DispatchOutput)
+assert isinstance(MoriEPLLDispatchOutput, DispatchOutput)
+
 
 
 class MoriEPNormalCombineInput(NamedTuple):
@@ -69,12 +85,26 @@ class MoriEPNormalCombineInput(NamedTuple):
         return CombineInputFormat.DEEPEP_NORMAL
 
 
+class MoriEPLLCombineInput(NamedTuple):
+    """Mori EP combine input."""
+
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_LL
+
+
 assert isinstance(MoriEPNormalCombineInput, CombineInput)
+assert isinstance(MoriEPLLCombineInput, CombineInput)
 
 
 class EpMode(Enum):
     INTRA_NODE = "intra_node"
     INTER_NODE = "inter_node"
+    LOW_LATENCY = "low_latency"
 
 
 @dataclass(frozen=True)
@@ -97,6 +127,13 @@ def get_ep_dispatch_configs():
         ),
         EpMode.INTER_NODE: EpDispatchConfig(
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+            warp_num_per_block=8,
+            block_num=64,
+            rdma_block_num=32,
+        ),
+         # TODO(billishyahao): may need to set different configs for intra node async
+        EpMode.LOW_LATENCY: EpDispatchConfig(
+            kernel_type = mori.ops.EpDispatchCombineKernelType.AsyncLL,
             warp_num_per_block=8,
             block_num=64,
             rdma_block_num=32,
@@ -130,6 +167,10 @@ def init_mori_op(
     )
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
+    async_mode = get_bool_env_var("SGLANG_MORI_ASYNC_MODE", "False")
+    logger.info(f"{async_mode=}")
+    if async_mode:
+        mode = EpMode.LOW_LATENCY
     cfg = get_ep_dispatch_configs()[mode]
 
     kernel_type = cfg.kernel_type
@@ -162,6 +203,28 @@ def init_mori_op(
     return mori_op
 
 
+class CommStreamPool:
+    _streams = {}  # key -> torch.cuda.Stream
+
+    @classmethod
+    def _make_key(cls, group):
+        return (torch.cuda.current_device(), id(group))
+
+    @classmethod
+    def getStreamFromPool(cls, group) -> torch.cuda.Stream:
+        key = cls._make_key(group)
+        stream = cls._streams.get(key)
+        if stream is None:
+            stream = torch.cuda.Stream(priority=0)
+            cls._streams[key] = stream
+        return stream
+
+    @classmethod
+    def clear_group(cls, group):
+        key = (torch.cuda.current_device(), id(group))
+        cls._streams.pop(key, None)
+
+
 class _MoriEPDispatcherImplBase:
     def __init__(
         self,
@@ -173,6 +236,7 @@ class _MoriEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         return_recv_hook: bool,
+        async_finish: bool,
         deepep_mode: DeepEPMode,
     ):
         try:
@@ -187,6 +251,7 @@ class _MoriEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.return_recv_hook = return_recv_hook
+        self.async_finish = async_finish
         self.deepep_mode = deepep_mode
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
@@ -235,6 +300,18 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.quant_config = {}
         # [kk TODO] need to support mxfp4 type
         self.quant_func = get_hip_quant(QuantType.per_1x128)
+        self.enable_dual_stream = get_bool_env_var("SGLANG_MORI_DUAL_STREAM", "False")
+        self._comm_stream = None
+        if self.enable_dual_stream:
+            self._comm_stream = CommStreamPool.getStreamFromPool(self.group)
+
+    def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
+        assert self.enable_dual_stream, "dual stream must be enabled"
+        if not self.async_finish:
+            return None
+        ev = torch.cuda.Event(blocking=False, interprocess=False)
+        ev.record(torch.cuda.current_stream())
+        return ev
 
     def dispatch_a(
         self,
@@ -243,10 +320,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
+        previous_event = self._capture_event_if_async() if self._comm_stream else None
+
         return (
             hidden_states,
             topk_weights,
             topk_ids,
+            previous_event
         )
 
     def dispatch_b(
@@ -254,6 +334,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         hidden_states,
         topk_weights,
         topk_ids,
+        previous_event,
     ):
         num_token = hidden_states.shape[0]
         scale = None
@@ -283,14 +364,24 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             recv_scales,
             recv_topk_ids,
             packed_recv_count,
-        ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, scale)
+            done_event,
+        ) = self._dispatch_core(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            scale=scale,
+            previous_event=previous_event
+        )
+
+        if self._comm_stream and self.async_finish and done_event is not None:
+            torch.cuda.current_stream().wait_event(done_event)
 
         return MoriEPNormalDispatchOutput(
-            packed_recv_hidden,
-            recv_scales,
-            recv_topk_ids,
-            recv_topk_weights,
-            packed_recv_count,
+            hidden_states=packed_recv_hidden,
+            hidden_states_scale=recv_scales,
+            topk_ids=recv_topk_ids,
+            topk_weights=recv_topk_weights,
+            num_recv_tokens_per_expert=packed_recv_count,
         )
 
     def _dispatch_core(
@@ -299,19 +390,250 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
+        previous_event: Optional[torch.cuda.Event] = None,
     ):
-        (
+        done_event: Optional[torch.cuda.Event] = None
+
+        if self._comm_stream:
+            compute_stream = torch.cuda.current_stream()
+            comm_stream = self._comm_stream # comm stream
+
+            for t in (hidden_states, topk_weights, topk_ids):
+                t.record_stream(comm_stream)
+            if scale is not None:
+                scale.record_stream(comm_stream)
+
+            with torch.cuda.stream(comm_stream):
+                # if (previous_event) stream_wait(comm_stream, previous_event)
+                # else stream_wait(comm_stream, compute_stream)
+
+                if previous_event is not None:
+                    comm_stream.wait_event(previous_event)
+                else:
+                    comm_stream.wait_stream(compute_stream)
+
+                (
+                    packed_recv_hidden,
+                    recv_topk_weights,
+                    recv_scales,
+                    recv_topk_ids,
+                    packed_recv_count
+                ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+
+                if self.async_finish:
+                    done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                    done_event.record(comm_stream)
+                else:
+                    compute_stream.wait_stream(comm_stream)
+
+            for t in (
+                packed_recv_hidden,
+                recv_topk_weights,
+                recv_scales,
+                recv_topk_ids,
+            ):
+                if t is not None:
+                    t.record_stream(comm_stream)
+        else:
+
+            (
+                packed_recv_hidden,
+                recv_topk_weights,
+                recv_scales,
+                recv_topk_ids,
+                packed_recv_count
+            ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+
+
+        #TODO(billishyahao): EPLB
+        # get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+
+        return  (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
             packed_recv_count,
-        ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+            done_event,
+        )
 
-        # TODO(billishyahao): EPLB
-        # get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
+    ):
+        previous_event = self._capture_event_if_async() if self._comm_stream else None
+        return hidden_states, topk_ids, topk_weights, previous_event
+
+    def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
+        # logger.info(f"bill-dbg: before comb combine_b: {hidden_states.shape=}")
+        # logger.info(f"bill-dbg: before comb combine_b: {topk_ids.shape=}")
+        # logger.info(f"bill-dbg: before comb combine_b: {topk_weights.shape=}")
+
+        hidden_states, done_event = self._combine_core(
+            hidden_states, topk_ids, topk_weights, previous_event
+        )
+
+        if self._comm_stream and self.async_finish and done_event is not None:
+            torch.cuda.current_stream().wait_event(done_event)
+
+        # logger.info(f"bill-dbg: after comb combine_b: {hidden_states.shape=}")
+        return hidden_states
+
+    def _combine_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        previous_event: Optional[torch.cuda.Event],
+    ):
+        done_event: Optional[torch.cuda.Event] = None
+        
+        if self._comm_stream:
+            compute_stream = torch.cuda.current_stream()
+            comm_stream = self._comm_stream
+
+            for t in (hidden_states, topk_ids, topk_weights):
+                t.record_stream(comm_stream)
+
+            with torch.cuda.stream(comm_stream):
+                if previous_event is not None:
+                    comm_stream.wait_event(previous_event)
+                else:
+                    comm_stream.wait_stream(compute_stream)
+
+                combined_hidden_states = self.mori_op.combine(
+                    hidden_states, None, topk_ids
+                )[0]
+
+                if self.async_finish:
+                    done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                    done_event.record(comm_stream)
+                else:
+                    compute_stream.wait_stream(comm_stream)
+            
+            combined_hidden_states.record_stream(comm_stream)
+
+        else:
+            combined_hidden_states = self.mori_op.combine(
+                hidden_states, None, topk_ids
+            )[0]
+
+        return combined_hidden_states, done_event
+    
+    def set_quant_config(self, quant_config: dict):
+        self.quant_config = quant_config
+
+
+class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.quant_config = {}
+        self.quant_func = get_hip_quant(QuantType.per_1x128)
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        assert self.mori_op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL, "mori asyncll mismatch"
+
+        num_tokens = hidden_states.shape[0]
+        scale = None
+
+        fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+
+        if fp8_dispatch:
+            # FP8 quant
+            if num_tokens > 0:
+                # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
+                hidden_states, scale = self.quant_func(
+                    hidden_states, quant_dtype=fp8_dtype
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // 128),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+        (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count
+        ) = self._dispatch_core(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            scale=scale
+        )
 
         return (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_topk_ids,
+            recv_scales,
+            packed_recv_count,
+            topk_weights,
+            topk_ids,
+        )
+
+    def dispatch_b(
+        self,
+        hidden_states,
+        recv_topk_weights,
+        recv_topk_ids,
+        recv_scales,
+        packed_recv_count,
+        topk_weights,
+        topk_ids
+    ):
+
+        ##TODO(billishyahao): add assertion here to check async 
+        assert self.mori_op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL, "mori asyncll mismatch"
+
+        # logger.info(f"bill-dbg: mori_op.dispatch_recv start")
+
+        self.mori_op.dispatch_recv()
+        # logger.info(f"bill-dbg: mori_op.dispatch_recv end")
+
+        return MoriEPLLDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=recv_scales,
+            topk_ids=recv_topk_ids,
+            topk_weights=recv_topk_weights,
+            num_recv_tokens_per_expert=packed_recv_count,
+        )
+
+    def _dispatch_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        scale: Optional[torch.Tensor] = None
+    ):
+        ##TODO(billishyahao): add assertion here to check async 
+        
+        # logger.info(f"bill-dbg: mori_op.dispatch_send start")
+        (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count
+        ) = self.mori_op.dispatch_send(hidden_states, topk_weights, scale, topk_ids)
+        # logger.info(f"bill-dbg: mori_op.dispatch_send end")
+
+        return  (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
@@ -326,24 +648,50 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         overlap_args: Optional[CombineOverlapArgs] = None,
     ):
-        previous_event = None
-        return hidden_states, topk_ids, topk_weights, previous_event
+        hidden_states = self._combine_core(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            overlap_args=overlap_args,
+        )
+        return hidden_states, topk_ids, topk_weights, overlap_args
 
     def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
-        hidden_states = self._combine_core(hidden_states, topk_ids, topk_weights)
-        return hidden_states
+        # logger.info(f"bill-dbg: before comb combine_b: {hidden_states.shape=}")
+        # logger.info(f"bill-dbg: before comb combine_b: {topk_ids.shape=}")
+        # logger.info(f"bill-dbg: before comb combine_b: {topk_weights.shape=}")
+
+        # logger.info(f"bill-dbg: mori_op.combine_recv start")
+
+        self.mori_op.combine_recv()
+
+        # logger.info(f"bill-dbg: mori_op.combine_recv end")
+
+        # logger.info(f"bill-dbg: after comb combine_b: {hidden_states.shape=}")
+        return hidden_states[0]
 
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
-        combined_hidden_states = self.mori_op.combine(hidden_states, None, topk_ids)
-        return combined_hidden_states[0]
+        
+        # logger.info(f"bill-dbg: mori_op.combine_send start")
 
+        combined_hidden_states = self.mori_op.combine_send(
+            hidden_states, None, topk_ids
+        )
+
+        # logger.info(f"bill-dbg: mori_op.combine_send end")
+
+
+        return combined_hidden_states
+    
     def set_quant_config(self, quant_config: dict):
         self.quant_config = quant_config
+
 
 
 @dataclass
@@ -370,6 +718,20 @@ class MoriEPDispatcher(BaseDispatcher):
     ):
         self.deepep_mode = deepep_mode
 
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher = _MoriEPDispatcherImplLowLatency(
+                group=group,
+                router_topk=router_topk,
+                permute_fusion=permute_fusion,
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                params_dtype=params_dtype,
+                return_recv_hook=return_recv_hook,
+                async_finish=async_finish,
+                deepep_mode=deepep_mode,
+            )
+
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _MoriEPDispatcherImplNormal(
                 group=group,
@@ -380,10 +742,10 @@ class MoriEPDispatcher(BaseDispatcher):
                 hidden_size=hidden_size,
                 params_dtype=params_dtype,
                 return_recv_hook=return_recv_hook,
+                async_finish=async_finish,
                 deepep_mode=deepep_mode,
             )
-        if self.deepep_mode.enable_low_latency():
-            raise NotImplementedError
+        
 
         self._stage = _Stage.INITIAL
 
@@ -446,7 +808,7 @@ class MoriEPDispatcher(BaseDispatcher):
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
-            raise NotImplementedError
+            return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
@@ -456,6 +818,6 @@ class MoriEPDispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict):
         if self.deepep_mode.enable_low_latency():
-            raise NotImplementedError
+            self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)

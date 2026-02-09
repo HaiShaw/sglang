@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 try:
     from aiter import (
         flash_attn_varlen_func,
+        flash_attn_varlen_fp8_pertensor_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
         mha_batch_prefill_func,
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
+_use_mha_fp8_kernel = get_bool_env_var("SGLANG_AITER_MHA_FP8", "True")
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
@@ -1046,18 +1048,42 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    o = flash_attn_varlen_func(
-                        q,
-                        k,
-                        v,
-                        qo_indptr,
-                        qo_indptr,
-                        max_q_len,
-                        max_q_len,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                    )
+                    if _use_mha_fp8_kernel:
+                        from aiter import per_tensor_quant
+
+                        q, q_descale = per_tensor_quant(q, quant_dtype=fp8_dtype)
+                        k, k_descale = per_tensor_quant(k, quant_dtype=fp8_dtype)
+                        v, v_descale = per_tensor_quant(v, quant_dtype=fp8_dtype)
+
+                        o = flash_attn_varlen_fp8_pertensor_func(
+                            q,
+                            k,
+                            v,
+                            q_descale,
+                            k_descale,
+                            v_descale,
+                            qo_indptr,
+                            qo_indptr,
+                            max_q_len,
+                            max_q_len,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                        )
+                    else:
+
+                        o = flash_attn_varlen_func(
+                            q,
+                            k,
+                            v,
+                            qo_indptr,
+                            qo_indptr,
+                            max_q_len,
+                            max_q_len,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                        )
                     return o
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)

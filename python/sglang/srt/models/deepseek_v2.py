@@ -2460,7 +2460,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
-        state.num_tokens = hidden_states.shape[0]
+        if get_moe_a2a_backend().is_mori():
+            state.num_tokens = hidden_states.shape[0]
         state.update(
             dict(
                 forward_batch=forward_batch,

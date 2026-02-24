@@ -1086,23 +1086,26 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         if forward_mode.is_decode_or_idle():
-            kv_indptr = self.kv_indptr
-            kv_indices = self.cuda_graph_kv_indices
+            qo_indptr = None
+            kv_last_page_len = None
+            max_q_len = None
+
             if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = self.cuda_graph_kv_indices
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
+                    req_pool_indices,
+                    seq_lens,
                     kv_indptr,
                     None,
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
             else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]

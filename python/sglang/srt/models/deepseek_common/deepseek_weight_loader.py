@@ -238,7 +238,6 @@ class DeepseekV2WeightLoaderMixin:
                             continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-
                         maybe_executor_submit(
                             executor=executor,
                             futures=futures,

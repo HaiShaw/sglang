@@ -52,7 +52,7 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
-        self.exclude_layers = cast(list[str], self.quant_config.get("exclude"))
+        self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
 

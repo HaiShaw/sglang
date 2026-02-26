@@ -118,7 +118,6 @@ def _is_equal_or_regex_match(
             return True
     elif target == value:
         return True
-
     return False
 
 

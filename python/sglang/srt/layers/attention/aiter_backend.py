@@ -13,7 +13,10 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton, create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -39,7 +42,7 @@ try:
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-    from aiter.ops.triton.unified_attention import unified_attention
+    from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -183,7 +186,7 @@ class AiterAttnBackend(AttentionBackend):
                     model_runner, self
                 )
 
-        self.use_triton_unified_attention = False 
+        self.use_triton_unified_attention = False
         if model_runner.model_config.sliding_window_size > 0:
             self.use_triton_unified_attention = True
         # aiter kernel related initialization
@@ -463,7 +466,9 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr = kv_indptr[: bs + 1]
                 if not self.use_triton_unified_attention:
                     kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                        forward_batch.seq_lens_sum,
+                        dtype=torch.int32,
+                        device=self.device,
                     )
                     create_flashinfer_kv_indices_triton[(bs,)](
                         self.req_to_token,
@@ -478,7 +483,7 @@ class AiterAttnBackend(AttentionBackend):
                     max_q_len = 1
                     max_kv_len = torch.max(forward_batch.seq_lens).item()
                     kv_indices = torch.empty(
-                       bs, max_kv_len, dtype=torch.int32, device=self.device 
+                        bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
 
                     create_flashmla_kv_indices_triton[(bs,)](
@@ -493,7 +498,9 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     qo_indptr = self.qo_indptr[: bs + 1]
-                    qo_indptr[1 : bs + 1] = torch.cumsum(self.kv_last_page_len[:bs], dim=0)
+                    qo_indptr[1 : bs + 1] = torch.cumsum(
+                        self.kv_last_page_len[:bs], dim=0
+                    )
 
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -1465,7 +1472,7 @@ class AiterAttnBackend(AttentionBackend):
         num_seqs = len(query_lens)
         block_tables = block_tables.cpu().numpy()
         _, block_size, num_kv_heads, head_size = key_cache.shape
-    
+
         outputs: list[torch.Tensor] = []
         start_idx = 0
         for i in range(num_seqs):
@@ -1473,15 +1480,15 @@ class AiterAttnBackend(AttentionBackend):
             kv_len = kv_lens[i]
             q = query[start_idx : start_idx + query_len]
             q *= scale
-    
+
             num_kv_blocks = (kv_len + block_size - 1) // block_size
             block_indices = block_tables[i, :num_kv_blocks]
-    
+
             k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
             k = k[:kv_len]
             v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
             v = v[:kv_len]
-    
+
             if q.shape[1] != k.shape[1]:
                 k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
                 v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
@@ -1507,10 +1514,10 @@ class AiterAttnBackend(AttentionBackend):
             if sinks is not None:
                 attn = attn[..., :-1]
             out = torch.einsum("hqk,khd->qhd", attn, v)
-    
+
             outputs.append(out)
             start_idx += query_len
-    
+
         return torch.cat(outputs, dim=0)
 
     def forward_extend(
@@ -1989,58 +1996,69 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            #window_size = (-1, -1)
-            #if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            #    window_size = (layer.sliding_window_size - 1, 0)
-
-            window_size = None
-
+            window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = layer.sliding_window_size
+                window_size = (layer.sliding_window_size - 1, 0)
 
-            #logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {v_cache.shape=} {self.use_triton_unified_attention=} {sinks.shape=} {self.forward_metadata.max_kv_len=} {self.forward_metadata.kv_indices.shape=} {self.forward_metadata.kv_indices=} {self.forward_metadata.kv_indptr=} {forward_batch.seq_lens=}")
+            ## for ref_paged_attn
+            # window_size = None
 
+            # if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            #    window_size = layer.sliding_window_size
             qo_indptr = torch.ones(q.shape[0], dtype=torch.int32, device=q.device)
 
+            # logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {v_cache.shape=} {self.use_triton_unified_attention=} {sinks.shape=} {self.forward_metadata.max_kv_len=} {self.forward_metadata.kv_indices.shape=} {self.forward_metadata.kv_indices=} {self.forward_metadata.kv_indptr=} {forward_batch.seq_lens=}")
+
+            # logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.tp_k_head_num=} {layer.tp_v_head_num=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {self.forward_metadata.qo_indptr=} {self.forward_metadata.max_q_len=} {self.forward_metadata.max_kv_len=} {forward_batch.seq_lens=} {self.forward_metadata.kv_indices.shape=}")
+
             if self.use_triton_unified_attention:
-                o = self.ref_paged_attn(
-                    query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    key_cache=k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                    value_cache=v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                    query_lens=qo_indptr,
-                    kv_lens=forward_batch.seq_lens,
-                    block_tables=self.forward_metadata.kv_indices,
-                    scale=self.scale,
-                    sliding_window=window_size,
-                    soft_cap=0,
+
+                o = torch.empty_like(q)
+
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v=v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                    out=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    cu_seqlens_q=self.forward_metadata.qo_indptr,
+                    seqused_k=forward_batch.seq_lens,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=self.forward_metadata.max_kv_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=self.forward_metadata.kv_indices,
+                    softcap=0,
+                    q_descale=None,
+                    k_descale=None,
+                    v_descale=None,
                     sinks=sinks,
                 )
 
-                o = o.view(-1, layer.tp_q_head_num*layer.qk_head_dim)
+                o = o.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-                #print(f"{o.shape=} {o=} {layer.sliding_window_size=}", flush=True)
-
-                #o = torch.empty_like(q)
-                #unified_attention(
-                #    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                #    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                #    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                #    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                #    cu_seqlens_q=self.forward_metadata.qo_indptr,
-                #    seqused_k=self.forward_metadata.kv_indptr,
-                #    max_seqlen_q=self.forward_metadata.max_q_len,
-                #    max_seqlen_k=self.forward_metadata.max_kv_len,
-                #    softmax_scale=self.scale,
-                #    causal=True,
-                #    alibi_slopes=None,
-                #    window_size=window_size,
-                #    block_table=self.forward_metadata.kv_indices,
-                #    softcap=0,
-                #    q_descale=None,
-                #    k_descale=None,
-                #    v_descale=None,
+                # o = self.ref_paged_attn(
+                #    query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                #    key_cache=k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                #    value_cache=v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                #    query_lens=qo_indptr,
+                #    kv_lens=forward_batch.seq_lens,
+                #    block_tables=self.forward_metadata.kv_indices,
+                #    scale=self.scale,
+                #    sliding_window=layer.sliding_window_size if layer.sliding_window_size > -1 else None,
+                #    soft_cap=0,
                 #    sinks=sinks,
-                #)
+                # )
+
+                # o = o.view(-1, layer.tp_q_head_num*layer.qk_head_dim)
+
+                # atol, rtol = 1.5e-2, 1e-2
+
+                # torch.testing.assert_close(
+                #    o2, o, atol=atol, rtol=rtol
+                # ), f"{torch.max(torch.abs(o2 - o))}"
+
+                # print(f"{o.shape=} {o2.shape=} {o=} {o2=} {layer.sliding_window_size=} {window_size=}", flush=True)
             else:
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

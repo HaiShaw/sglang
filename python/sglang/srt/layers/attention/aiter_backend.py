@@ -933,19 +933,45 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = None
 
             if spec_info is None:
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
+
+                if not self.use_triton_unified_attention:
+                    kv_indptr = self.kv_indptr
+                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    kv_indices = self.cuda_graph_kv_indices
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                else:
+                    max_q_len = 1
+                    max_kv_len = torch.max(seq_lens).item()
+                    kv_indices = self.cuda_graph_kv_indices.view(
+                        -1, self.max_context_len
+                    )
+
+                    create_flashmla_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        seq_lens,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                        self.max_context_len,
+                        1,
+                    )
+
+                    qo_indptr = self.qo_indptr[: bs + 1]
+                    qo_indptr[1 : bs + 1] = torch.cumsum(
+                        self.cuda_graph_kv_last_page_len[:bs], dim=0
+                    )
+
+                    kv_indptr = None
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -990,7 +1016,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                kv_indptr[-1].item() if kv_indptr is not None else max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1230,19 +1256,44 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = None
 
             if spec_info is None:
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
+                if not self.use_triton_unified_attention:
+                    kv_indptr = self.kv_indptr
+                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    kv_indices = self.cuda_graph_kv_indices
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                else:
+                    max_q_len = 1
+                    max_kv_len = torch.max(seq_lens).item()
+                    kv_indices = self.cuda_graph_kv_indices.view(
+                        -1, self.max_context_len
+                    )
+
+                    create_flashmla_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        seq_lens,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                        self.max_context_len,
+                        1,
+                    )
+
+                    qo_indptr = self.qo_indptr[: bs + 1]
+                    qo_indptr[1 : bs + 1] = torch.cumsum(
+                        self.cuda_graph_kv_last_page_len[:bs], dim=0
+                    )
+
+                    kv_indptr = None
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -1281,22 +1332,22 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    kv_last_page_len,
-                    max_q_len,
-                    kv_indptr[-1].item(),
-                    work_metadata=work_metadata,
-                    work_info_set=work_info_set,
-                    work_indptr=work_indptr,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
-                )
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                kv_indptr[-1].item() if kv_indptr is not None else max_kv_len,
+                work_metadata=work_metadata,
+                work_info_set=work_info_set,
+                work_indptr=work_indptr,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                num_kv_splits=num_kv_splits,
+                # num_kv_splits_indptr=num_kv_splits_indptr,
+            )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -2005,7 +2056,7 @@ class AiterAttnBackend(AttentionBackend):
 
             # if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             #    window_size = layer.sliding_window_size
-            qo_indptr = torch.ones(q.shape[0], dtype=torch.int32, device=q.device)
+            # qo_indptr = torch.ones(q.shape[0], dtype=torch.int32, device=q.device)
 
             # logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {v_cache.shape=} {self.use_triton_unified_attention=} {sinks.shape=} {self.forward_metadata.max_kv_len=} {self.forward_metadata.kv_indices.shape=} {self.forward_metadata.kv_indices=} {self.forward_metadata.kv_indptr=} {forward_batch.seq_lens=}")
 

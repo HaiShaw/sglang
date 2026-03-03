@@ -13,7 +13,7 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton, create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -39,6 +39,7 @@ try:
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+    from aiter.ops.triton.unified_attention import unified_attention
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -182,6 +183,9 @@ class AiterAttnBackend(AttentionBackend):
                     model_runner, self
                 )
 
+        self.use_triton_unified_attention = False 
+        if model_runner.model_config.sliding_window_size > 0:
+            self.use_triton_unified_attention = True
         # aiter kernel related initialization
         self.max_num_partitions = (
             self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
@@ -189,7 +193,7 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not self.use_mla:
+        if not (self.use_mla and self.use_triton_unified_attention):
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -441,6 +445,7 @@ class AiterAttnBackend(AttentionBackend):
         qo_indptr = None
         kv_last_page_len = None
         max_q_len = None
+        max_kv_len = None
 
         work_metadata = None
         work_indptr = None
@@ -456,18 +461,40 @@ class AiterAttnBackend(AttentionBackend):
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
-                )
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
+                if not self.use_triton_unified_attention:
+                    kv_indices = torch.empty(
+                        forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                    )
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                else:
+                    max_q_len = 1
+                    max_kv_len = torch.max(forward_batch.seq_lens).item()
+                    kv_indices = torch.empty(
+                       bs, max_kv_len, dtype=torch.int32, device=self.device 
+                    )
+
+                    create_flashmla_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                        max_kv_len,
+                        1,
+                    )
+
+                    qo_indptr = self.qo_indptr[: bs + 1]
+                    qo_indptr[1 : bs + 1] = torch.cumsum(self.kv_last_page_len[:bs], dim=0)
+
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -512,7 +539,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                None,
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1422,6 +1449,70 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def ref_paged_attn(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        query_lens: list[int],
+        kv_lens: list[int],
+        block_tables: torch.Tensor,
+        scale: float,
+        sliding_window: Optional[int] = None,
+        soft_cap: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_seqs = len(query_lens)
+        block_tables = block_tables.cpu().numpy()
+        _, block_size, num_kv_heads, head_size = key_cache.shape
+    
+        outputs: list[torch.Tensor] = []
+        start_idx = 0
+        for i in range(num_seqs):
+            query_len = query_lens[i]
+            kv_len = kv_lens[i]
+            q = query[start_idx : start_idx + query_len]
+            q *= scale
+    
+            num_kv_blocks = (kv_len + block_size - 1) // block_size
+            block_indices = block_tables[i, :num_kv_blocks]
+    
+            k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
+            k = k[:kv_len]
+            v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+            v = v[:kv_len]
+    
+            if q.shape[1] != k.shape[1]:
+                k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+                v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+            attn = torch.einsum("qhd,khd->hqk", q, k).float()
+            empty_mask = torch.ones(query_len, kv_len, device=q.device)
+            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+            if sliding_window is not None:
+                sliding_window_mask = (
+                    torch.triu(
+                        empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                    )
+                    .bool()
+                    .logical_not()
+                )
+                mask |= sliding_window_mask
+            if soft_cap is not None and soft_cap > 0:
+                attn = soft_cap * torch.tanh(attn / soft_cap)
+            attn.masked_fill_(mask, float("-inf"))
+            if sinks is not None:
+                s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
+                attn = torch.cat((attn, s_aux), dim=-1)
+            attn = torch.softmax(attn, dim=-1).to(v.dtype)
+            if sinks is not None:
+                attn = attn[..., :-1]
+            out = torch.einsum("hqk,khd->qhd", attn, v)
+    
+            outputs.append(out)
+            start_idx += query_len
+    
+        return torch.cat(outputs, dim=0)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1831,6 +1922,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -1844,7 +1936,6 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1898,27 +1989,80 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            paged_attention_ragged(
-                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                self.workspace_buffer,
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                self.scale,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.kv_last_page_len,
-                1,
-                self.max_num_partitions,
-                None,
-                "auto",
-                "NHD",
-                self.logits_soft_cap,
-                self.k_scale,
-                self.v_scale,
-                None,
-                _AITER_PARTITION_SIZE_ROCM,
-            )
+            #window_size = (-1, -1)
+            #if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            #    window_size = (layer.sliding_window_size - 1, 0)
+
+            window_size = None
+
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                window_size = layer.sliding_window_size
+
+            #logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {v_cache.shape=} {self.use_triton_unified_attention=} {sinks.shape=} {self.forward_metadata.max_kv_len=} {self.forward_metadata.kv_indices.shape=} {self.forward_metadata.kv_indices=} {self.forward_metadata.kv_indptr=} {forward_batch.seq_lens=}")
+
+            qo_indptr = torch.ones(q.shape[0], dtype=torch.int32, device=q.device)
+
+            if self.use_triton_unified_attention:
+                o = self.ref_paged_attn(
+                    query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    key_cache=k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                    value_cache=v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                    query_lens=qo_indptr,
+                    kv_lens=forward_batch.seq_lens,
+                    block_tables=self.forward_metadata.kv_indices,
+                    scale=self.scale,
+                    sliding_window=window_size,
+                    soft_cap=0,
+                    sinks=sinks,
+                )
+
+                o = o.view(-1, layer.tp_q_head_num*layer.qk_head_dim)
+
+                #print(f"{o.shape=} {o=} {layer.sliding_window_size=}", flush=True)
+
+                #o = torch.empty_like(q)
+                #unified_attention(
+                #    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                #    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                #    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                #    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                #    cu_seqlens_q=self.forward_metadata.qo_indptr,
+                #    seqused_k=self.forward_metadata.kv_indptr,
+                #    max_seqlen_q=self.forward_metadata.max_q_len,
+                #    max_seqlen_k=self.forward_metadata.max_kv_len,
+                #    softmax_scale=self.scale,
+                #    causal=True,
+                #    alibi_slopes=None,
+                #    window_size=window_size,
+                #    block_table=self.forward_metadata.kv_indices,
+                #    softcap=0,
+                #    q_descale=None,
+                #    k_descale=None,
+                #    v_descale=None,
+                #    sinks=sinks,
+                #)
+            else:
+                paged_attention_ragged(
+                    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    self.workspace_buffer,
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.scale,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.kv_last_page_len,
+                    1,
+                    self.max_num_partitions,
+                    None,
+                    "auto",
+                    "NHD",
+                    self.logits_soft_cap,
+                    self.k_scale,
+                    self.v_scale,
+                    None,
+                    _AITER_PARTITION_SIZE_ROCM,
+                )
 
         return o
 

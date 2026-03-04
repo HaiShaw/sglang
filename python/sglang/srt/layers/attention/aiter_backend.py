@@ -1507,70 +1507,6 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def ref_paged_attn(
-        self,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        query_lens: list[int],
-        kv_lens: list[int],
-        block_tables: torch.Tensor,
-        scale: float,
-        sliding_window: Optional[int] = None,
-        soft_cap: Optional[float] = None,
-        sinks: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        num_seqs = len(query_lens)
-        block_tables = block_tables.cpu().numpy()
-        _, block_size, num_kv_heads, head_size = key_cache.shape
-
-        outputs: list[torch.Tensor] = []
-        start_idx = 0
-        for i in range(num_seqs):
-            query_len = query_lens[i]
-            kv_len = kv_lens[i]
-            q = query[start_idx : start_idx + query_len]
-            q *= scale
-
-            num_kv_blocks = (kv_len + block_size - 1) // block_size
-            block_indices = block_tables[i, :num_kv_blocks]
-
-            k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
-            k = k[:kv_len]
-            v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
-            v = v[:kv_len]
-
-            if q.shape[1] != k.shape[1]:
-                k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-                v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-            attn = torch.einsum("qhd,khd->hqk", q, k).float()
-            empty_mask = torch.ones(query_len, kv_len, device=q.device)
-            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-            if sliding_window is not None:
-                sliding_window_mask = (
-                    torch.triu(
-                        empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                    )
-                    .bool()
-                    .logical_not()
-                )
-                mask |= sliding_window_mask
-            if soft_cap is not None and soft_cap > 0:
-                attn = soft_cap * torch.tanh(attn / soft_cap)
-            attn.masked_fill_(mask, float("-inf"))
-            if sinks is not None:
-                s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
-                attn = torch.cat((attn, s_aux), dim=-1)
-            attn = torch.softmax(attn, dim=-1).to(v.dtype)
-            if sinks is not None:
-                attn = attn[..., :-1]
-            out = torch.einsum("hqk,khd->qhd", attn, v)
-
-            outputs.append(out)
-            start_idx += query_len
-
-        return torch.cat(outputs, dim=0)
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2051,17 +1987,6 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size - 1, 0)
 
-            ## for ref_paged_attn
-            # window_size = None
-
-            # if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            #    window_size = layer.sliding_window_size
-            # qo_indptr = torch.ones(q.shape[0], dtype=torch.int32, device=q.device)
-
-            # logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {v_cache.shape=} {self.use_triton_unified_attention=} {sinks.shape=} {self.forward_metadata.max_kv_len=} {self.forward_metadata.kv_indices.shape=} {self.forward_metadata.kv_indices=} {self.forward_metadata.kv_indptr=} {forward_batch.seq_lens=}")
-
-            # logger.info(f"{layer.tp_q_head_num=} {layer.qk_head_dim=} {layer.tp_k_head_num=} {layer.tp_v_head_num=} {layer.v_head_dim=} {q.shape=} {k_cache.shape=} {self.forward_metadata.qo_indptr=} {self.forward_metadata.max_q_len=} {self.forward_metadata.max_kv_len=} {forward_batch.seq_lens=} {self.forward_metadata.kv_indices.shape=}")
-
             if self.use_triton_unified_attention:
 
                 o = torch.empty_like(q)
@@ -2088,28 +2013,6 @@ class AiterAttnBackend(AttentionBackend):
 
                 o = o.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-                # o = self.ref_paged_attn(
-                #    query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                #    key_cache=k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                #    value_cache=v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                #    query_lens=qo_indptr,
-                #    kv_lens=forward_batch.seq_lens,
-                #    block_tables=self.forward_metadata.kv_indices,
-                #    scale=self.scale,
-                #    sliding_window=layer.sliding_window_size if layer.sliding_window_size > -1 else None,
-                #    soft_cap=0,
-                #    sinks=sinks,
-                # )
-
-                # o = o.view(-1, layer.tp_q_head_num*layer.qk_head_dim)
-
-                # atol, rtol = 1.5e-2, 1e-2
-
-                # torch.testing.assert_close(
-                #    o2, o, atol=atol, rtol=rtol
-                # ), f"{torch.max(torch.abs(o2 - o))}"
-
-                # print(f"{o.shape=} {o2.shape=} {o=} {o2=} {layer.sliding_window_size=} {window_size=}", flush=True)
             else:
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

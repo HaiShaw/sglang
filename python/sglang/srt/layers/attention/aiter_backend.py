@@ -1983,11 +1983,14 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            window_size = (-1, -1)
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = (layer.sliding_window_size - 1, 0)
-
             if self.use_triton_unified_attention:
+
+                window_size = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    window_size = (layer.sliding_window_size - 1, 0)
 
                 o = torch.empty_like(q)
 
@@ -2010,8 +2013,6 @@ class AiterAttnBackend(AttentionBackend):
                     v_descale=None,
                     sinks=sinks,
                 )
-
-                o = o.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
             else:
                 paged_attention_ragged(

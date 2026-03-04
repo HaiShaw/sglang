@@ -1031,7 +1031,8 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             ]
         elif get_moe_a2a_backend().is_mori():
             self._inners = [
-                MoriEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                MoriEPDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

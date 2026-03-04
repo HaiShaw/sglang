@@ -182,6 +182,7 @@ def init_mori_op(
     params_dtype,
     num_max_dispatch_tokens_per_rank,
     deepep_mode,
+    instance_id=0,
 ):
 
     import mori
@@ -191,9 +192,10 @@ def init_mori_op(
 
     gpu_per_node = 8 if world_size >= 8 else world_size
 
+    group_name = f"mori_{instance_id}"
     cpu_group = group.cpu_group
-    torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-    mori.shmem.shmem_torch_process_group_init("mori")
+    torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
+    mori.shmem.shmem_torch_process_group_init(group_name)
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
     async_mode = deepep_mode.enable_low_latency()
@@ -201,7 +203,9 @@ def init_mori_op(
         mode = EpMode.LOW_LATENCY
 
     logger.info(
-        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=} {mode=}"
+        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
+        f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
+        f"{router_topk=} {mode=}"
     )
 
     cfg = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
@@ -270,6 +274,7 @@ class _MoriEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        instance_id: int = 0,
     ):
         try:
             import mori  # noqa: F401
@@ -283,6 +288,7 @@ class _MoriEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.instance_id = instance_id
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
@@ -297,6 +303,7 @@ class _MoriEPDispatcherImplBase:
             self.params_dtype,
             self.num_max_dispatch_tokens_per_rank,
             self.deepep_mode,
+            self.instance_id,
         )
 
         self.quant_config: Optional[dict] = None
@@ -367,27 +374,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
-        previous_event = self._capture_event_if_async() if self._comm_stream else None
-
-        return (hidden_states, topk_weights, topk_ids, previous_event)
-
-    def dispatch_b(
-        self,
-        hidden_states,
-        topk_weights,
-        topk_ids,
-        previous_event,
-    ):
         num_token = hidden_states.shape[0]
         output_dtype = hidden_states.dtype
         scale = None
-
         fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
 
         if fp8_dispatch:
-            # FP8 quant
             if num_token > 0:
-                # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
                 hidden_states, scale = self.quant_func(
                     hidden_states, quant_dtype=fp8_dtype
                 )
@@ -400,6 +393,27 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     dtype=torch.float32,
                     device=hidden_states.device,
                 )
+
+        previous_event = self._capture_event_if_async() if self._comm_stream else None
+
+        return (
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            scale,
+            output_dtype,
+            previous_event,
+        )
+
+    def dispatch_b(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        scale,
+        output_dtype,
+        previous_event,
+    ):
 
         (
             packed_recv_hidden,
@@ -746,6 +760,7 @@ class MoriEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        instance_id: int = 0,
     ):
         super().__init__()
 
@@ -760,6 +775,7 @@ class MoriEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            instance_id=instance_id,
         )
 
         if self.deepep_mode.enable_low_latency():

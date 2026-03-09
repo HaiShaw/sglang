@@ -508,11 +508,6 @@ class AiterAttnBackend(AttentionBackend):
                         bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
 
-                    # page_table = self.req_to_token[forward_batch.req_pool_indices, :max_kv_len]
-
-                    # for idx in range(bs):
-                    #    print(f"{idx=} {page_table[idx]=}", flush=True)
-
                     create_flashmla_kv_indices_triton[(bs,)](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
@@ -1620,91 +1615,6 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def ref_paged_attn(
-        self,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        query_lens: list[int],
-        kv_lens: list[int],
-        block_tables: torch.Tensor,
-        scale: float,
-        sliding_window: Optional[int] = None,
-        soft_cap: Optional[float] = None,
-        sinks: Optional[torch.Tensor] = None,
-        is_swa_layer: Optional[bool] = False,
-    ) -> torch.Tensor:
-        num_seqs = len(query_lens)
-        block_tables = block_tables.cpu().numpy()
-        _, block_size, num_kv_heads, head_size = key_cache.shape
-
-        outputs: list[torch.Tensor] = []
-        start_idx = 0
-        for i in range(num_seqs):
-            query_len = query_lens[i]
-            kv_len = kv_lens[i]
-            q = query[start_idx : start_idx + query_len]
-            q *= scale
-
-            num_kv_blocks = (kv_len + block_size - 1) // block_size
-            block_indices = block_tables[i, :num_kv_blocks]
-
-            # if is_swa_layer and self.use_sliding_window_kv_pool:
-            #    block_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-            #        block_indices
-            #    )
-
-            # base = np.repeat(block_indices, block_size) * block_size
-            # offset = np.tile(np.arange(block_size), len(block_indices))
-
-            ##base = block_indices.repeat_interleave(page_size) * page_size
-            ##offset = torch.arange(page_size).repeat(len(block_indices))
-
-            # expanded = base + offset
-
-            ##print(f"kkkkk {i=} {kv_len=} {num_kv_blocks=} {block_size=} {block_indices=} {expanded=}", flush=True)
-
-            k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
-            k = k[:kv_len]
-            v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
-            v = v[:kv_len]
-
-            # k = key_cache.view(-1, num_kv_heads, head_size)[expanded]
-            # k = k[:kv_len]
-            # v = value_cache.view(-1, num_kv_heads, head_size)[expanded]
-            # v = v[:kv_len]
-
-            if q.shape[1] != k.shape[1]:
-                k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-                v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-            attn = torch.einsum("qhd,khd->hqk", q, k).float()
-            empty_mask = torch.ones(query_len, kv_len, device=q.device)
-            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-            if sliding_window is not None:
-                sliding_window_mask = (
-                    torch.triu(
-                        empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                    )
-                    .bool()
-                    .logical_not()
-                )
-                mask |= sliding_window_mask
-            if soft_cap is not None and soft_cap > 0:
-                attn = soft_cap * torch.tanh(attn / soft_cap)
-            attn.masked_fill_(mask, float("-inf"))
-            if sinks is not None:
-                s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
-                attn = torch.cat((attn, s_aux), dim=-1)
-            attn = torch.softmax(attn, dim=-1).to(v.dtype)
-            if sinks is not None:
-                attn = attn[..., :-1]
-            out = torch.einsum("hqk,khd->qhd", attn, v)
-
-            outputs.append(out)
-            start_idx += query_len
-
-        return torch.cat(outputs, dim=0)
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2192,7 +2102,6 @@ class AiterAttnBackend(AttentionBackend):
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
                 page_table = self.forward_metadata.kv_indices
-                # page_table = self.req_to_token[forward_batch.req_pool_indices[:bs], :self.forward_metadata.max_kv_len]
 
                 if (
                     layer.sliding_window_size is not None
@@ -2200,11 +2109,10 @@ class AiterAttnBackend(AttentionBackend):
                 ):
                     window_size = (layer.sliding_window_size - 1, 0)
                     page_table = self.forward_metadata.swa_page_table
-                    # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    #    page_table
-                    # )
 
                 o = torch.empty_like(q)
+
+                max_kv_len = page_table.shape[1]
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2218,7 +2126,7 @@ class AiterAttnBackend(AttentionBackend):
                     cu_seqlens_q=self.forward_metadata.qo_indptr,
                     seqused_k=forward_batch.seq_lens,
                     max_seqlen_q=self.forward_metadata.max_q_len,
-                    max_seqlen_k=self.forward_metadata.max_kv_len,
+                    max_seqlen_k=max_kv_len,
                     softmax_scale=self.scale,
                     causal=True,
                     window_size=window_size,
@@ -2229,48 +2137,6 @@ class AiterAttnBackend(AttentionBackend):
                     v_descale=None,
                     sinks=sinks,
                 )
-
-                ## for ref_paged_attn
-                # window_size = None
-                # is_swa_layer = (
-                #    layer.sliding_window_size is not None and layer.sliding_window_size > -1
-                # )
-
-                # if is_swa_layer:
-                #   window_size = layer.sliding_window_size
-
-                # qo_indptr = torch.ones(q.shape[0], dtype=torch.int32, device=q.device)
-
-                # page_size = self.page_size
-
-                # bs = forward_batch.batch_size
-
-                # page_table = self.req_to_token[forward_batch.req_pool_indices, :self.forward_metadata.max_kv_len]
-
-                # if is_swa_layer and self.use_sliding_window_kv_pool:
-                #    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                #        page_table
-                #    )
-
-                ##for idx in range(bs):
-                ##    print(f"{idx=} {page_table[idx]=} {self.forward_metadata.kv_indices[idx]=}", flush=True)
-
-                # o = self.ref_paged_attn(
-                #   query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                #   key_cache=k_cache.view(-1, page_size, layer.tp_k_head_num, layer.qk_head_dim),
-                #   value_cache=v_cache.view(-1, page_size, layer.tp_v_head_num, layer.v_head_dim),
-                #   query_lens=qo_indptr,
-                #   kv_lens=forward_batch.seq_lens,
-                #   block_tables=page_table, #self.forward_metadata.kv_indices,
-                #   scale=self.scale,
-                #   sliding_window=layer.sliding_window_size if layer.sliding_window_size > -1 else None,
-                #   soft_cap=0,
-                #   sinks=sinks,
-                #   is_swa_layer=is_swa_layer,
-                # )
-
-                # o = o.view(-1, layer.tp_q_head_num*layer.qk_head_dim)
-
             else:
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

@@ -52,6 +52,7 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
@@ -148,6 +149,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif _use_aiter:
+            return gemm_a16w16(x, layer.weight, bias=bias, dtype=x.dtype)
 
         return F.linear(x, layer.weight, bias)
 

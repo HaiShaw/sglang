@@ -422,7 +422,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
 
         if fp8_dispatch:
             if num_token > 0:
-                hidden_states, scale = self.quant_func(
+                hidden_states, scale = self.fp8_quant_func(
                     hidden_states, quant_dtype=fp8_dtype
                 )
             else:

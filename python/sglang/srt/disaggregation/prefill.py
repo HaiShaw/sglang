@@ -381,6 +381,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+            self.maybe_send_health_check_signal()
+
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
@@ -420,6 +422,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+            self.maybe_send_health_check_signal()
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -535,13 +539,12 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        if self.current_scheduler_metrics_enabled:
-            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-            self.log_prefill_stats(
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        self.report_prefill_stats(
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

@@ -22,6 +22,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from aiter.ops.cache import reshape_and_cache_flash
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -62,7 +63,7 @@ from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -287,7 +288,7 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
@@ -307,6 +308,9 @@ class GptOssAttention(nn.Module):
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
         )
         self.layer_id = layer_id
+        self.kv_scale = torch.tensor(
+            [1.0], dtype=torch.float32, device=self.o_proj.weight.device
+        )
 
     def forward_prepare(
         self,
@@ -332,7 +336,45 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        q, k = self.rotary_emb(positions, q, k, **extra_args)
+        # q, k = self.rotary_emb(positions, q, k, **extra_args)
+        q, k = self.rotary_emb(positions, q, k)
+
+        ###### reshape_and_cache_flash ######
+        layer_id = self.attn.layer_id
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+
+        page_size = token_to_kv_pool.page_size
+
+        is_swa_layer = self.attn.sliding_window_size > 0
+
+        slot_mapping = (
+            forward_batch.out_cache_loc
+            if (not is_swa_layer)
+            else token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+        )
+
+        slot_mapping = slot_mapping.long()
+
+        key_cache = token_to_kv_pool.get_key_buffer(layer_id).view(
+            -1, page_size, self.attn.tp_k_head_num, self.attn.qk_head_dim
+        )
+        value_cache = token_to_kv_pool.get_value_buffer(layer_id).view(
+            -1, page_size, self.attn.tp_v_head_num, self.attn.v_head_dim
+        )
+
+        reshape_and_cache_flash(
+            k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
+            v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim),
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "auto",
+            self.kv_scale,
+            self.kv_scale,
+        )
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -343,7 +385,8 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=False,
+            # save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
         return output

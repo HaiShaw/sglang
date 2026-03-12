@@ -205,10 +205,23 @@ def init_mori_op(
 
     gpu_per_node = 8 if world_size >= 8 else world_size
 
-    group_name = f"mori_{instance_id}"
+    group_name = f"mori"
     cpu_group = group.cpu_group
-    torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
-    mori.shmem.shmem_torch_process_group_init(group_name)
+    try:
+        torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
+    except Exception as e:
+        if "already registered" in str(e):
+            logger.info(
+                f"[MORI init] The same process group is already "
+                f"registered. Ignoring [{str(e)}]"
+            )
+        else:
+            raise
+    else:
+        # If new group is newly registered then need to init mori shmem. However
+        # if the group is registered already then need to skip init mori shmem
+        # and reuse the previous one.
+        mori.shmem.shmem_torch_process_group_init(group_name)
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
     async_mode = deepep_mode.enable_low_latency()

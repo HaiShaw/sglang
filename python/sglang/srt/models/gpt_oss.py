@@ -63,7 +63,7 @@ from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -288,7 +288,7 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope_wrapper(
+        self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
@@ -336,8 +336,7 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        # q, k = self.rotary_emb(positions, q, k, **extra_args)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, **extra_args)
 
         ###### reshape_and_cache_flash ######
         layer_id = self.attn.layer_id
@@ -347,15 +346,9 @@ class GptOssAttention(nn.Module):
 
         is_swa_layer = self.attn.sliding_window_size > 0
 
-        slot_mapping = (
-            forward_batch.out_cache_loc
-            if (not is_swa_layer)
-            else token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
-        )
+        slot_mapping = forward_batch.out_cache_loc
 
-        slot_mapping = slot_mapping.long()
+        slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
         key_cache = token_to_kv_pool.get_key_buffer(layer_id).view(
             -1, page_size, self.attn.tp_k_head_num, self.attn.qk_head_dim
@@ -373,6 +366,7 @@ class GptOssAttention(nn.Module):
             "auto",
             self.kv_scale,
             self.kv_scale,
+            slot_mapping_swa.long() if self.attn.sliding_window_size > 0 else None,
         )
 
         inner_state = q, k, v, forward_batch

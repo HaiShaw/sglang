@@ -333,7 +333,6 @@ class GptOssAttention(nn.Module):
                 ),
             }
         q, k = self.rotary_emb(positions, q, k, **extra_args)
-
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 

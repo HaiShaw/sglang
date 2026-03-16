@@ -54,6 +54,8 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
+from sglang.srt.layers.attention.utils import launch_reshape_and_cache_flash
+
 logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
@@ -1983,18 +1985,34 @@ class AiterAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        self.logits_soft_cap = layer.logit_cap
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
 
-        self.logits_soft_cap = layer.logit_cap
-
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_mla:
+                if self.use_triton_unified_attention:
+                    token_to_kv_pool = forward_batch.token_to_kv_pool
+                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
+
+                    launch_reshape_and_cache_flash (
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
+                        v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                        cache_loc,
+                        slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                    )
+
+                elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -2360,9 +2378,25 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            if self.use_triton_unified_attention:
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
+
+                launch_reshape_and_cache_flash (
+                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.out_cache_loc,
+                    slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)

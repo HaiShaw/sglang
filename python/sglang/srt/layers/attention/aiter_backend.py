@@ -49,12 +49,13 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.utils import pad_sequence_with_mask
+from sglang.srt.layers.attention.utils import (
+    launch_reshape_and_cache_flash,
+    pad_sequence_with_mask,
+)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
-
-from sglang.srt.layers.attention.utils import launch_reshape_and_cache_flash
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +464,7 @@ class AiterAttnBackend(AttentionBackend):
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
     def _resolve_v2_num_draft_tokens(
         self,
         extend_seq_lens: Optional[torch.Tensor] = None,
@@ -631,7 +633,7 @@ class AiterAttnBackend(AttentionBackend):
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                
+
                 if not self.use_triton_unified_attention:
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
@@ -2003,13 +2005,21 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
-                    launch_reshape_and_cache_flash (
+                    launch_reshape_and_cache_flash(
                         k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                         v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
-                        v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
                         cache_loc,
-                        slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                        (
+                            slot_mapping_swa.long()
+                            if layer.sliding_window_size > 0
+                            else None
+                        ),
                     )
 
                 elif self.use_mla:
@@ -2385,11 +2395,15 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
-                launch_reshape_and_cache_flash (
+                launch_reshape_and_cache_flash(
                     k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
-                    v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
                     forward_batch.out_cache_loc,
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
                 )

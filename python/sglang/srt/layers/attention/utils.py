@@ -480,24 +480,18 @@ def reshape_and_cache_flash(
     value_ptr,
     key_cache_ptr,
     value_cache_ptr,
-
     slot_mapping_ptr,
     swa_slot_mapping_ptr,
-
     k_scale_ptr,
     v_scale_ptr,
-
     block_stride,
     key_stride,
     value_stride,
-
     num_heads,
     head_size,
     block_size,
-
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
-
     HAS_SWA: tl.constexpr,
     USE_SCALE: tl.constexpr,
 ):
@@ -560,14 +554,11 @@ def reshape_and_cache_flash(
     # target layout
     # [block_idx, block_offset, head, dim]
     # ----------------------------------
-    tgt = (
-        block_idx * block_stride
-        + block_offset * num_heads * head_size
-        + offs
-    )
+    tgt = block_idx * block_stride + block_offset * num_heads * head_size + offs
 
     tl.store(key_cache_ptr + tgt, k, mask=mask)
     tl.store(value_cache_ptr + tgt, v, mask=mask)
+
 
 def launch_reshape_and_cache_flash(
     key,
@@ -597,24 +588,18 @@ def launch_reshape_and_cache_flash(
         value,
         key_cache,
         value_cache,
-
         slot_mapping,
         swa_slot_mapping if swa_slot_mapping is not None else key,
-
         k_scale if k_scale is not None else key,
         v_scale if v_scale is not None else key,
-
         key_cache.stride(0),
         key.stride(0),
         value.stride(0),
-
         num_heads,
         head_size,
         key_cache.shape[1],
-
         HEAD_BLOCK=HEAD_BLOCK,
         BLOCK_D=BLOCK_D,
-
         HAS_SWA=(swa_slot_mapping is not None),
         USE_SCALE=(k_scale is not None),
     )

@@ -203,6 +203,8 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             self.token_to_kv_pool = model_runner.token_to_kv_pool
             self.use_triton_unified_attention = True
+        else:
+            self.use_triton_unified_attention = False
 
         # aiter kernel related initialization
         self.max_num_partitions = (

@@ -22,7 +22,8 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from aiter.ops.cache import reshape_and_cache_flash
+#from aiter.ops.cache import reshape_and_cache_flash
+from sglang.srt.layers.attention.utils import launch_reshape_and_cache_flash
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -357,16 +358,15 @@ class GptOssAttention(nn.Module):
             -1, page_size, self.attn.tp_v_head_num, self.attn.v_head_dim
         )
 
-        reshape_and_cache_flash(
+        launch_reshape_and_cache_flash (
             k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
             v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim),
             key_cache,
             value_cache,
             slot_mapping,
-            "auto",
-            self.kv_scale,
-            self.kv_scale,
             slot_mapping_swa.long() if self.attn.sliding_window_size > 0 else None,
+            self.kv_scale,
+            self.kv_scale,
         )
 
         inner_state = q, k, v, forward_batch

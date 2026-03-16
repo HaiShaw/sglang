@@ -472,3 +472,149 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
         return concat_mla_absorb_q(q_nope, q_rope)
     else:
         return torch.cat([q_nope, q_rope], dim=-1)
+
+
+@triton.jit
+def reshape_and_cache_flash(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+
+    slot_mapping_ptr,
+    swa_slot_mapping_ptr,
+
+    k_scale_ptr,
+    v_scale_ptr,
+
+    block_stride,
+    key_stride,
+    value_stride,
+
+    num_heads,
+    head_size,
+    block_size,
+
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+
+    HAS_SWA: tl.constexpr,
+    USE_SCALE: tl.constexpr,
+):
+    # ----------------------------------
+    # program ids
+    # pid0 = token
+    # pid1 = head block
+    # ----------------------------------
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+
+    # ----------------------------------
+    # slot mapping
+    # ----------------------------------
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+
+    if HAS_SWA:
+        slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
+
+    if slot_idx < 0:
+        return
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    # ----------------------------------
+    # head range
+    # ----------------------------------
+    head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+
+    head_mask = head_idx < num_heads
+
+    dim_idx = tl.arange(0, BLOCK_D)
+
+    # shape = [HEAD_BLOCK, BLOCK_D]
+    offs = head_idx[:, None] * head_size + dim_idx[None, :]
+
+    mask = head_mask[:, None] & (dim_idx[None, :] < head_size)
+
+    # ----------------------------------
+    # source load
+    # ----------------------------------
+    src_key = token_idx * key_stride + offs
+    src_value = token_idx * value_stride + offs
+
+    k = tl.load(key_ptr + src_key, mask=mask)
+    v = tl.load(value_ptr + src_value, mask=mask)
+
+    # ----------------------------------
+    # optional scale
+    # ----------------------------------
+    if USE_SCALE:
+        k_scale = tl.load(k_scale_ptr)
+        v_scale = tl.load(v_scale_ptr)
+
+        k = k / k_scale
+        v = v / v_scale
+
+    # ----------------------------------
+    # target layout
+    # [block_idx, block_offset, head, dim]
+    # ----------------------------------
+    tgt = (
+        block_idx * block_stride
+        + block_offset * num_heads * head_size
+        + offs
+    )
+
+    tl.store(key_cache_ptr + tgt, k, mask=mask)
+    tl.store(value_cache_ptr + tgt, v, mask=mask)
+
+def launch_reshape_and_cache_flash(
+    key,
+    value,
+    key_cache,
+    value_cache,
+    slot_mapping,
+    swa_slot_mapping=None,
+    k_scale=None,
+    v_scale=None,
+):
+    num_tokens = key.shape[0]
+    num_heads = key.shape[1]
+    head_size = key.shape[2]
+
+    HEAD_BLOCK = 4
+
+    BLOCK_D = triton.next_power_of_2(head_size)
+
+    grid = (
+        num_tokens,
+        triton.cdiv(num_heads, HEAD_BLOCK),
+    )
+
+    reshape_and_cache_flash[grid](
+        key,
+        value,
+        key_cache,
+        value_cache,
+
+        slot_mapping,
+        swa_slot_mapping if swa_slot_mapping is not None else key,
+
+        k_scale if k_scale is not None else key,
+        v_scale if v_scale is not None else key,
+
+        key_cache.stride(0),
+        key.stride(0),
+        value.stride(0),
+
+        num_heads,
+        head_size,
+        key_cache.shape[1],
+
+        HEAD_BLOCK=HEAD_BLOCK,
+        BLOCK_D=BLOCK_D,
+
+        HAS_SWA=(swa_slot_mapping is not None),
+        USE_SCALE=(k_scale is not None),
+    )

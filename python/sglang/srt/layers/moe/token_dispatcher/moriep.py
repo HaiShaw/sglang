@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
@@ -171,31 +170,22 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     }
 
 
-@lru_cache(maxsize=4)
-def _get_mori_dispatch_quant_flags(is_nextn=False):
-    fp8_var, fp4_var = "SGLANG_MORI_FP8_DISP", "SGLANG_MORI_FP4_DISP"
-    if is_nextn and (
-        "SGLANG_MORI_NEXTN_FP8_DISP" in os.environ
-        or "SGLANG_MORI_NEXTN_FP4_DISP" in os.environ
-    ):
-        fp8_var, fp4_var = "SGLANG_MORI_NEXTN_FP8_DISP", "SGLANG_MORI_NEXTN_FP4_DISP"
-
-    fp8_dispatch = get_bool_env_var(fp8_var, "False")
-    fp4_dispatch = get_bool_env_var(fp4_var, "False")
-
+@lru_cache(maxsize=2)
+def _get_mori_dispatch_quant_flags():
+    fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+    fp4_dispatch = get_bool_env_var("SGLANG_MORI_FP4_DISP", "False")
     if fp8_dispatch and fp4_dispatch:
         logger.warning(
-            f"Both {fp8_var} and {fp4_var} are set to True. "
-            f"Using {fp4_var} and ignoring {fp8_var}."
+            "Both SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are set to True. "
+            "Using SGLANG_MORI_FP4_DISP and ignoring SGLANG_MORI_FP8_DISP."
         )
         fp8_dispatch = False
-
     return fp8_dispatch, fp4_dispatch
 
 
 # init_mori_op only needs do once in model initial stage
 # use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=2)
 def init_mori_op(
     group,
     router_topk,
@@ -205,8 +195,6 @@ def init_mori_op(
     params_dtype,
     num_max_dispatch_tokens_per_rank,
     deepep_mode,
-    fp8_dispatch,
-    fp4_dispatch,
     instance_id=0,
 ):
 
@@ -257,6 +245,8 @@ def init_mori_op(
     scale_dim = 1
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
+
+    fp8_dispatch, fp4_dispatch = _get_mori_dispatch_quant_flags()
 
     if fp8_dispatch:
         scale_dim = hidden_size // 128
@@ -338,7 +328,6 @@ class _MoriEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
-        is_nextn: bool = False,
         instance_id: int = 0,
     ):
         try:
@@ -353,9 +342,7 @@ class _MoriEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-        self.is_nextn = is_nextn
         self.instance_id = instance_id
-        self.fp8_dispatch, self.fp4_dispatch = _get_mori_dispatch_quant_flags(is_nextn)
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
@@ -370,8 +357,6 @@ class _MoriEPDispatcherImplBase:
             self.params_dtype,
             self.num_max_dispatch_tokens_per_rank,
             self.deepep_mode,
-            self.fp8_dispatch,
-            self.fp4_dispatch,
             self.instance_id,
         )
 
@@ -447,7 +432,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.fp8_dispatch:
+        fp8_dispatch, fp4_dispatch = _get_mori_dispatch_quant_flags()
+
+        if fp8_dispatch:
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -465,7 +452,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
 
-        elif self.fp4_dispatch:
+        elif fp4_dispatch:
             # FP4 quant
             if num_token > 0:
                 hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
@@ -691,7 +678,9 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.fp8_dispatch:
+        fp8_dispatch, fp4_dispatch = _get_mori_dispatch_quant_flags()
+
+        if fp8_dispatch:
             # FP8 quant
             if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -709,7 +698,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
 
-        elif self.fp4_dispatch:
+        elif fp4_dispatch:
             # FP4 quant
             if num_tokens > 0:
                 hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
@@ -863,7 +852,6 @@ class MoriEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        is_nextn: bool = False,
         instance_id: int = 0,
     ):
         super().__init__()
@@ -879,7 +867,6 @@ class MoriEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
-            is_nextn=is_nextn,
             instance_id=instance_id,
         )
 

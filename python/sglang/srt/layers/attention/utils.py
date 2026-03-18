@@ -495,6 +495,44 @@ def reshape_and_cache_flash(
     HAS_SWA: tl.constexpr,
     USE_SCALE: tl.constexpr,
 ):
+    """
+    Triton kernel for reshaping per-token K/V tensors into paged KV cache layout.
+
+    Source layout:
+        key/value: [num_tokens, num_heads, head_size]
+
+    Target cache layout:
+        cache: [num_blocks, block_size, num_heads, head_size]
+
+    Each Triton program instance handles:
+        - one token (program_id(0))
+        - one block of heads (program_id(1))
+
+    Features:
+        - optional SWA slot remapping
+        - optional FP8 scale dequantization before cache write
+
+    Args:
+        key_ptr: Pointer to source key tensor.
+        value_ptr: Pointer to source value tensor.
+        key_cache_ptr: Pointer to destination key cache tensor.
+        value_cache_ptr: Pointer to destination value cache tensor.
+        slot_mapping_ptr: Maps token -> cache slot.
+        swa_slot_mapping_ptr: Optional second-stage slot remap for SWA mode.
+        k_scale_ptr: Optional key scaling factor pointer.
+        v_scale_ptr: Optional value scaling factor pointer.
+        block_stride: Stride between cache blocks.
+        key_stride: Stride between source key tokens.
+        value_stride: Stride between source value tokens.
+        num_heads: Number of attention heads.
+        head_size: Hidden dimension per head.
+        block_size: Number of slots per cache block.
+        HEAD_BLOCK: Number of heads processed per program.
+        BLOCK_D: Vectorized dimension size (power-of-2 padded).
+        HAS_SWA: Enable SWA remapping.
+        USE_SCALE: Enable scale division before storing.
+    """
+
     # ----------------------------------
     # program ids
     # pid0 = token
@@ -570,6 +608,23 @@ def launch_reshape_and_cache_flash(
     k_scale=None,
     v_scale=None,
 ):
+    """
+    Launch wrapper for reshape_and_cache_flash Triton kernel.
+
+    This wrapper prepares launch configuration and dispatches the Triton kernel
+    that writes token-major K/V tensors into paged KV cache layout.
+
+    Args:
+        key: Source key tensor [num_tokens, num_heads, head_size]
+        value: Source value tensor [num_tokens, num_heads, head_size]
+        key_cache: Destination key cache [num_blocks, block_size, num_heads, head_size]
+        value_cache: Destination value cache [num_blocks, block_size, num_heads, head_size]
+        slot_mapping: Token-to-cache slot mapping
+        swa_slot_mapping: Optional SWA remapping table
+        k_scale: Optional key scaling factor
+        v_scale: Optional value scaling factor
+    """
+
     num_tokens = key.shape[0]
     num_heads = key.shape[1]
     head_size = key.shape[2]

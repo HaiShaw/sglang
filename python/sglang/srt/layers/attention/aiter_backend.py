@@ -1984,6 +1984,12 @@ class AiterAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if self.use_triton_unified_attention:
+                    k_descale = None 
+                    v_descale = None
+                    if self.kv_cache_dtype == fp8_dtype:
+                        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                        v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2005,6 +2011,8 @@ class AiterAttnBackend(AttentionBackend):
                             if layer.sliding_window_size > 0
                             else None
                         ),
+                        k_scale=k_descale,
+                        v_scale=v_descale,
                     )
 
                 elif self.use_mla:
@@ -2327,11 +2335,20 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
+            q_descale = None
+            k_descale = None
+            v_descale = None
+
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                #dtype = q.dtype
+                #k_cache = k_cache.to(dtype)
+                #v_cache = v_cache.to(dtype)
+                q = q.to(fp8_dtype)
+
+                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                v_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
 
             window_size = (-1, -1)
             page_table = self.forward_metadata.kv_indices
@@ -2359,6 +2376,9 @@ class AiterAttnBackend(AttentionBackend):
                 return_attn_probs=False,
                 window_size=window_size,
                 sink_ptr=sinks,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -2386,6 +2406,12 @@ class AiterAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             if self.use_triton_unified_attention:
+                k_descale = None 
+                v_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                    v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2403,6 +2429,8 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -2451,12 +2479,22 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
+            q_descale = None
+            k_descale = None
+            v_descale = None
+
             # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
+                #dtype = q.dtype
 
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                #k_cache = k_cache.to(dtype)
+                #v_cache = v_cache.to(dtype)
+                q = q.to(fp8_dtype)
+
+                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+
 
             if self.use_triton_unified_attention:
 
@@ -2471,7 +2509,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size = (layer.sliding_window_size - 1, 0)
                     page_table = self.forward_metadata.swa_page_table
 
-                o = torch.empty_like(q)
+                o = torch.empty_like(q, dtype=self.input_dtype)
 
                 max_kv_len = page_table.shape[1]
 
@@ -2494,8 +2532,8 @@ class AiterAttnBackend(AttentionBackend):
                     block_table=page_table,
                     softcap=0,
                     q_descale=None,
-                    k_descale=None,
-                    v_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                     sinks=sinks,
                 )
             else:

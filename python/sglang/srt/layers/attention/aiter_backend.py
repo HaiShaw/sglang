@@ -634,7 +634,7 @@ class AiterAttnBackend(AttentionBackend):
 
         num_kv_splits = None
         swa_page_table = None
-        max_kv_len = forward_batch.seq_lens_cpu.max().item(),
+        max_kv_len = (forward_batch.seq_lens_cpu.max().item(),)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
@@ -2608,7 +2608,7 @@ class AiterIndicesUpdaterPrefill:
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
 
-            #self.max_kv_len = torch.max(paged_kernel_lens).item()
+            # self.max_kv_len = torch.max(paged_kernel_lens).item()
 
             extend_lens = seq_lens - prefix_lens
 

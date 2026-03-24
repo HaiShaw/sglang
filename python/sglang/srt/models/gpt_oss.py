@@ -62,7 +62,7 @@ from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -287,7 +287,7 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
@@ -332,17 +332,19 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        q, k = self.rotary_emb(positions, q, k, **extra_args)
+        # q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
-        return None, forward_batch, inner_state
+        return None, positions, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        hidden_states, forward_batch, inner_state = intermediate_state
+        hidden_states, positions, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
+            rotary_emb=self.rotary_emb,
+            positions=positions,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)

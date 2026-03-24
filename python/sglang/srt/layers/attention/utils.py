@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 
 from sglang.srt.utils import is_cuda
 
@@ -662,6 +661,35 @@ def launch_reshape_and_cache_flash(
 
 
 @triton.jit
+def _get_gptj_rotated_x(
+    x,
+    x_rotated_mask,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
+):
+    x_rotated = tl.where(x_rotated_mask, x, -x)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_D_HALF, 2))
+    x_rotated = tl.flip(x_rotated, 1)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
+    return x_rotated
+
+
+@triton.jit
+def _get_neox_rotated_x(
+    x,
+    x_rotated_mask,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
+):
+    x_rotated = tl.where(x_rotated_mask, x, -x)
+    x_rotated = tl.reshape(x_rotated, (2, BLOCK_D_HALF))
+    x_rotated = tl.flip(x_rotated, 1)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
+    x_rotated = tl.flip(x_rotated, 0)
+    return x_rotated
+
+
+@triton.jit
 def _unit_rope(
     x_ptrs,
     cos,
@@ -675,12 +703,12 @@ def _unit_rope(
 
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
-        x_pe_rotated = _get_neox_rotated_x_1D(
+        x_pe_rotated = _get_neox_rotated_x(
             x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
     else:
         x_rotated_mask = d_pe_offs % 2 == 0
-        x_pe_rotated = _get_gptj_rotated_x_1D(
+        x_pe_rotated = _get_gptj_rotated_x(
             x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
 
@@ -1086,10 +1114,6 @@ def fused_qk_rope_reshape_and_cache(
     - value_cache: same shape as input value_cache (inplace).
     - zeros_out: same shape as input q.
     """
-    # _LOGGER.info(
-    #    f"FUSED_QK_ROPE_RESHAPE_AND_CACHE: q={tuple(q.shape)} k={tuple(k.shape)} "
-    #    + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
-    # )
 
     t, qh, d = q.shape
     tk, kh, dk = k.shape

@@ -41,6 +41,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.utils import (
+    fused_qk_rope_reshape_and_cache,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -75,10 +78,11 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_npu, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_hip, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 class GptOssConfig(PretrainedConfig):
@@ -332,19 +336,40 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        # q, k = self.rotary_emb(positions, q, k, **extra_args)
+        if not _is_hip:
+            q, k = self.rotary_emb(positions, q, k, **extra_args)
+        else:
+            extra_args = extra_args["fused_set_kv_buffer_arg"]
+
+            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                q=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
+                k=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
+                v=v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim),
+                k_scale=self.attn.k_scale,
+                v_scale=self.attn.v_scale,
+                pos=positions,
+                cos=self.rotary_emb.cos_cache,
+                sin=self.rotary_emb.sin_cache,
+                is_neox=self.rotary_emb.is_neox_style,
+                flash_layout=True,
+                offs=None,
+                q_out=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
+                k_out=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
+                output_zeros=False,
+                **extra_args,
+            )
+
         inner_state = q, k, v, forward_batch
-        return None, positions, forward_batch, inner_state
+        return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        hidden_states, positions, forward_batch, inner_state = intermediate_state
+        hidden_states, forward_batch, inner_state = intermediate_state
+
         if inner_state is None:
             return hidden_states
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            rotary_emb=self.rotary_emb,
-            positions=positions,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)

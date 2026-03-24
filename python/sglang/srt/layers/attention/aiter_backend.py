@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
-from torch import nn
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
@@ -51,7 +50,6 @@ except ImportError:
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import (
-    fused_qk_rope_reshape_and_cache,
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
@@ -1989,8 +1987,6 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
-        positions=None,
-        rotary_emb: nn.Module = None,
     ):
         self.logits_soft_cap = layer.logit_cap
 
@@ -2029,69 +2025,24 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
-                    if rotary_emb is not None:
-                        q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-                            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                            v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                            k_cache.view(
-                                -1,
-                                self.page_size,
-                                layer.tp_k_head_num,
-                                layer.qk_head_dim,
-                            ),
-                            v_cache.view(
-                                -1,
-                                self.page_size,
-                                layer.tp_v_head_num,
-                                layer.v_head_dim,
-                            ),
-                            forward_batch.out_cache_loc,
-                            positions,
-                            rotary_emb.cos_cache,
-                            rotary_emb.sin_cache,
-                            k_descale,
-                            v_descale,
-                            rotary_emb.is_neox_style,
-                            flash_layout=True,
-                            apply_scale=(
-                                True if self.kv_cache_dtype == fp8_dtype else False
-                            ),
-                            offs=None,
-                            q_out=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                            k_out=k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                            output_zeros=False,
-                            swa_slot_mapping=(
-                                slot_mapping_swa.long()
-                                if layer.sliding_window_size > 0
-                                else None
-                            ),
-                        )
-                    else:
-                        launch_reshape_and_cache_flash(
-                            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                            v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                            k_cache.view(
-                                -1,
-                                self.page_size,
-                                layer.tp_k_head_num,
-                                layer.qk_head_dim,
-                            ),
-                            v_cache.view(
-                                -1,
-                                self.page_size,
-                                layer.tp_v_head_num,
-                                layer.v_head_dim,
-                            ),
-                            cache_loc,
-                            (
-                                slot_mapping_swa.long()
-                                if layer.sliding_window_size > 0
-                                else None
-                            ),
-                            k_scale=k_descale,
-                            v_scale=v_descale,
-                        )
+                    launch_reshape_and_cache_flash(
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        cache_loc,
+                        (
+                            slot_mapping_swa.long()
+                            if layer.sliding_window_size > 0
+                            else None
+                        ),
+                        k_scale=k_descale,
+                        v_scale=v_descale,
+                    )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
@@ -2457,8 +2408,6 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
-        positions=None,
-        rotary_emb: nn.Module = None,
     ):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -2495,55 +2444,20 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
-                if rotary_emb is not None:
-                    q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                        ),
-                        v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                        ),
-                        forward_batch.out_cache_loc,
-                        positions,
-                        rotary_emb.cos_cache,
-                        rotary_emb.sin_cache,
-                        k_descale,
-                        v_descale,
-                        rotary_emb.is_neox_style,
-                        flash_layout=True,
-                        apply_scale=True if self.kv_cache_dtype == fp8_dtype else False,
-                        offs=None,
-                        q_out=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k_out=k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                        output_zeros=False,
-                        swa_slot_mapping=(
-                            slot_mapping_swa.long()
-                            if layer.sliding_window_size > 0
-                            else None
-                        ),
-                    )
-                else:
-                    launch_reshape_and_cache_flash(
-                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                        ),
-                        v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                        ),
-                        forward_batch.out_cache_loc,
-                        (
-                            slot_mapping_swa.long()
-                            if layer.sliding_window_size > 0
-                            else None
-                        ),
-                        k_scale=k_descale,
-                        v_scale=v_descale,
-                    )
+                launch_reshape_and_cache_flash(
+                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    forward_batch.out_cache_loc,
+                    slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
+                )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
@@ -2747,8 +2661,6 @@ class AiterIndicesUpdaterPrefill:
 
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
-
-            # self.max_kv_len = torch.max(paged_kernel_lens).item()
 
             extend_lens = seq_lens - prefix_lens
 

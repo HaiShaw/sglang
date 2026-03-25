@@ -1153,9 +1153,7 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        self.cuda_graph_kv_last_page_len = torch.ones(
-            max_bs, dtype=torch.int, device=self.device
-        )
+        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
@@ -2009,16 +2007,6 @@ class AiterAttnBackend(AttentionBackend):
                     and self.use_sliding_window_kv_pool
                 ):
 
-                    k_descale = None
-                    v_descale = None
-                    if self.kv_cache_dtype == fp8_dtype:
-                        k_descale = (
-                            layer.k_scale if layer.k_scale is not None else self.k_scale
-                        )
-                        v_descale = (
-                            layer.v_scale if layer.v_scale is not None else self.k_scale
-                        )
-
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2040,8 +2028,6 @@ class AiterAttnBackend(AttentionBackend):
                             if layer.sliding_window_size > 0
                             else None
                         ),
-                        k_scale=k_descale,
-                        v_scale=v_descale,
                     )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
@@ -2426,16 +2412,6 @@ class AiterAttnBackend(AttentionBackend):
             # like full_to_swa_index_mapping.
             if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
 
-                k_descale = None
-                v_descale = None
-                if self.kv_cache_dtype == fp8_dtype:
-                    k_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    v_descale = (
-                        layer.v_scale if layer.v_scale is not None else self.k_scale
-                    )
-
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2453,8 +2429,6 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
-                    k_scale=k_descale,
-                    v_scale=v_descale,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(

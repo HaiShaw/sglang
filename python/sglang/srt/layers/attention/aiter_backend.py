@@ -2345,6 +2345,8 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
+            # To keep the mha_batch_prefill_func function parameters
+            # declare the necessary parameter and assign None as default value
             q_descale = None
 
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv

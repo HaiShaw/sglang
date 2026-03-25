@@ -667,9 +667,17 @@ def _get_gptj_rotated_x(
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
 ):
+    # GPT-J rotary layout:
+    # Pair adjacent dimensions and apply:
+    # [x0, x1, x2, x3] -> [-x1, x0, -x3, x2]
+
+    # Apply sign inversion on odd positions.
     x_rotated = tl.where(x_rotated_mask, x, -x)
+    # Reshape into (D/2, 2) pairs.
     x_rotated = tl.reshape(x_rotated, (BLOCK_D_HALF, 2))
+    # Swap each pair.
     x_rotated = tl.flip(x_rotated, 1)
+    # Flatten back to original shape.
     x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
     return x_rotated
 
@@ -681,9 +689,17 @@ def _get_neox_rotated_x(
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
 ):
+    # GPT-NeoX rotary layout:
+    # Split head dimension into two halves:
+    # [x0, x1, x2, x3] -> [-x2, -x3, x0, x1]
+
+    # Keep first half positive, second half negative.
     x_rotated = tl.where(x_rotated_mask, x, -x)
+    # Reshape into (2, D/2).
     x_rotated = tl.reshape(x_rotated, (2, BLOCK_D_HALF))
+    # Reverse each half.
     x_rotated = tl.flip(x_rotated, 1)
+    # Flatten and reverse full vector.
     x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
     x_rotated = tl.flip(x_rotated, 0)
     return x_rotated
@@ -699,8 +715,10 @@ def _unit_rope(
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
 ):
+    # Load one full attention head vector.
     x_pe = tl.load(x_ptrs)
 
+    # Stage 1: Build rotated vector according to rotary layout.
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
         x_pe_rotated = _get_neox_rotated_x(
@@ -712,6 +730,8 @@ def _unit_rope(
             x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
 
+    # Stage 2: Apply RoPE transform:
+    # x' = x*cos + rotate(x)*sin
     x_pe = x_pe * cos + x_pe_rotated * sin
 
     return x_pe
@@ -785,6 +805,12 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     HAVE_ZEROS: tl.constexpr = False,
     HAS_SWA: tl.constexpr = False,
 ):
+    # ============================================================
+    # Stage 0: Static stride assumptions for Triton compiler
+    #
+    # These assumptions help Triton optimize pointer arithmetic and
+    # simplify generated address calculations.
+    # ============================================================
 
     tl.assume(q_stride_t >= 0)
     tl.assume(q_stride_h >= 0)
@@ -818,14 +844,39 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     tl.assume(zeros_out_stride_h >= 0)
     tl.assume(zeros_out_stride_d >= 0)
 
+    # ============================================================
+    # Stage 1: Program instance mapping
+    #
+    # Each program handles:
+    #   - one (token, q_head) for Q path
+    #   - selected KV ownership for cache write path
+    #
+    # pid layout:
+    #   [0, T*QH)            -> decode Q path
+    #   [T*QH, extra KV)     -> KV-only path
+    # ============================================================
+
     pid = tl.program_id(0)
     tl.assume(pid >= 0)
 
     d_pe_offs = tl.arange(0, BLOCK_D_pe).to(tl.int64)
 
+    # ============================================================
+    # Stage 2: Main decode path (Q always active)
+    # ============================================================
+
     if pid < T * QH:
         pid_t = pid // QH
         pid_hq = pid % QH
+
+        # --------------------------------------------------------
+        # Stage 2.1: Compute rotary frequency offsets
+        #
+        # RoPE frequencies may be stored as:
+        #   D/2 frequencies (shared front-half)
+        #   D frequencies (full explicit)
+        # --------------------------------------------------------
+
         if REUSE_FREQS_FRONT_PART:
             if IS_NEOX:
                 d_cos_offs = d_pe_offs
@@ -842,14 +893,26 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             d_cos_offs = d_pe_offs
             # d_cos_mask = d_cos_offs < BLOCK_D_pe
 
+        # --------------------------------------------------------
+        # Stage 2.2: Load token position and optional offset
+        #
+        # offs_ptr is used by chunked prefill / sliding-window decode.
+        # --------------------------------------------------------
         pos = tl.load(pos_ptr + pid_t)
         if HAVE_POS:
             offset = tl.load(offs_ptr + pid_t)
             pos = pos + offset
+
+        # --------------------------------------------------------
+        # Stage 2.3: Load cosine / sine table
+        # --------------------------------------------------------
         cos_offs = pos * cos_stride_t + d_cos_offs * cos_stride_d
         cos = tl.load(cos_ptr + cos_offs)
         sin = tl.load(sin_ptr + cos_offs)
 
+        # --------------------------------------------------------
+        # Stage 2.4: Apply RoPE to Q
+        # --------------------------------------------------------
         q_ptrs = (
             q_ptr + pid_t * q_stride_t + pid_hq * q_stride_h + d_pe_offs * q_stride_d
         )
@@ -862,6 +925,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             BLOCK_D_pe,
             BLOCK_D_HALF_pe,
         )
+
+        # Store rotated Q output.
         q_out_ptrs = (
             q_out_ptr
             + pid_t * q_out_stride_t
@@ -880,11 +945,26 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             )
             tl.store(zeros_out_ptrs, z)
 
+        # ========================================================
+        # Stage 3: KV ownership path
+        #
+        # Only one Q group leader writes KV:
+        #   pid_hq % QH_PER_KH == 0
+        #
+        # This prevents duplicated KV cache writes.
+        # ========================================================
+
         if pid_hq % QH_PER_KH == 0:
+            # ----------------------------------------------------
+            # Stage 3.1: Resolve cache slot
+            # ----------------------------------------------------
             pid_slot = tl.load(slot_mapping_ptr + pid_t).to(tl.int64)
             if HAS_SWA:
                 pid_slot = tl.load(swa_slot_mapping_ptr + pid_slot)
 
+            # ------------------------------------------------
+            # Stage 3.2: Apply RoPE to K
+            # ------------------------------------------------
             if pid_slot >= 0:
                 pid_t_slot = pid_slot // BLOCK_SIZE
                 pid_b = pid_slot % BLOCK_SIZE
@@ -917,8 +997,20 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 )
                 tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
 
+                # ------------------------------------------------
+                # Stage 3.3: Optional fp8 scaling before cache
+                # ------------------------------------------------
+
                 k_scale_rcprl = 1 / k_scale
                 k_pe = k_pe * k_scale_rcprl
+
+                # ------------------------------------------------
+                # Stage 3.4: Write K cache
+                #
+                # Two layouts supported:
+                #   FLASH_LAYOUT
+                #   paged KV layout
+                # ------------------------------------------------
 
                 if FLASH_LAYOUT:
                     k_out_ptrs = (
@@ -942,6 +1034,14 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     )
 
                 tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
+
+                # ------------------------------------------------
+                # Stage 3.5: Write V cache
+                #
+                # Supports:
+                #   normal layout
+                #   shuffle layout
+                # ------------------------------------------------
 
                 v_ptrs = (
                     v_ptr
@@ -975,6 +1075,14 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                         + pid_b * value_cache_stride_b
                     )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+    # ============================================================
+    # Stage 4: Extra KV-only path
+    #
+    # Handles tokens that only require cache update:
+    #   T_slot > T
+    #
+    # No Q / no RoPE on Q branch.
+    # ============================================================
     else:
         pid = pid - T * QH + T * KH
         if pid < T_slot * KH:
@@ -1188,7 +1296,7 @@ def fused_qk_rope_reshape_and_cache(
     else:
         zeros_out = None
 
-    n_pid = t * qh + (t_slot - t) * kh
+    n_pid = t * qh + (t_slot - t) * kh if t_slot >= t else t * qh
     grid = (n_pid, 1, 1)
     _fused_qk_rope_reshape_and_cache_kernel[grid](
         q,

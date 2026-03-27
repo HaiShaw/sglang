@@ -81,7 +81,6 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
-    is_hip,
     is_npu,
     is_sm90_supported,
     make_layers,
@@ -90,7 +89,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_tinygemm_supported = (
     _is_cuda
     and is_flashinfer_available()
@@ -397,14 +395,12 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-
         q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
-
         if inner_state is None:
             return hidden_states
         attn_output = self.attn(

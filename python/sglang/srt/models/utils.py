@@ -130,7 +130,7 @@ def create_fused_set_kv_buffer_arg(
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
 
-    if _is_cuda:
+    if not _is_hip:
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
         return FusedSetKVBufferArg(
             value=value,
@@ -138,7 +138,7 @@ def create_fused_set_kv_buffer_arg(
             v_buffer=v_buffer.view(v_buffer.shape[0], -1),
             cache_loc=forward_batch.out_cache_loc,
         )
-    elif _is_hip:
+    else:
         page_size = token_to_kv_pool.page_size
         slot_mapping_swa = (
             token_to_kv_pool.full_to_swa_index_mapping.long()

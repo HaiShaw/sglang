@@ -738,13 +738,27 @@ def _unit_rope(
 
 
 @triton.jit
+def _load_cos_sin(
+    cos_sin_ptr,
+    pos,
+    d_cos_offs,
+    stride_t,
+    stride_d,
+    freq_dim,
+):
+    base = pos * stride_t
+    cos = tl.load(cos_sin_ptr + base + d_cos_offs * stride_d)
+    sin = tl.load(cos_sin_ptr + base + (d_cos_offs + freq_dim) * stride_d)
+    return cos, sin
+
+
+@triton.jit
 def _fused_qk_rope_reshape_and_cache_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
     pos_ptr,
-    cos_ptr,
-    sin_ptr,
+    cos_sin_ptr,
     offs_ptr,
     key_cache_ptr,
     value_cache_ptr,
@@ -764,8 +778,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     v_stride_t,
     v_stride_h,
     v_stride_d,
-    cos_stride_t,
-    cos_stride_d,
+    cos_sin_stride_t,
+    cos_sin_stride_d,
     q_out_stride_t,
     q_out_stride_h,
     q_out_stride_d,
@@ -821,8 +835,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     tl.assume(v_stride_t >= 0)
     tl.assume(v_stride_h >= 0)
     tl.assume(v_stride_d >= 0)
-    tl.assume(cos_stride_t >= 0)
-    tl.assume(cos_stride_d >= 0)
+    tl.assume(cos_sin_stride_t >= 0)
+    tl.assume(cos_sin_stride_d >= 0)
     tl.assume(q_out_stride_t >= 0)
     tl.assume(q_out_stride_h >= 0)
     tl.assume(q_out_stride_d >= 0)
@@ -906,9 +920,20 @@ def _fused_qk_rope_reshape_and_cache_kernel(
         # --------------------------------------------------------
         # Stage 2.3: Load cosine / sine table
         # --------------------------------------------------------
-        cos_offs = pos * cos_stride_t + d_cos_offs * cos_stride_d
-        cos = tl.load(cos_ptr + cos_offs)
-        sin = tl.load(sin_ptr + cos_offs)
+        # cos_offs = pos * cos_stride_t + d_cos_offs * cos_stride_d
+        # cos = tl.load(cos_ptr + cos_offs)
+        # sin = tl.load(sin_ptr + cos_offs)
+
+        freq_dim = BLOCK_D_HALF_pe if REUSE_FREQS_FRONT_PART else BLOCK_D_pe
+
+        cos, sin = _load_cos_sin(
+            cos_sin_ptr,
+            pos,
+            d_cos_offs,
+            cos_sin_stride_t,
+            cos_sin_stride_d,
+            freq_dim,
+        )
 
         # --------------------------------------------------------
         # Stage 2.4: Apply RoPE to Q
@@ -1183,8 +1208,7 @@ def fused_qk_rope_reshape_and_cache(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     pos: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    cos_sin: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     is_neox: bool,
@@ -1273,7 +1297,7 @@ def fused_qk_rope_reshape_and_cache(
         block_size
     ), "block_size should be power of 2"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
+    d_freq = cos_sin.shape[-1] // 2
     assert (d_freq == d // 2) or (
         d_freq == d
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -1303,8 +1327,7 @@ def fused_qk_rope_reshape_and_cache(
         k,
         v,
         pos,
-        cos,
-        sin,
+        cos_sin,
         offs,
         key_cache,
         value_cache,
@@ -1318,8 +1341,8 @@ def fused_qk_rope_reshape_and_cache(
         *q.stride(),
         *k.stride(),
         *v.stride(),
-        cos.stride(0),
-        cos.stride(-1),
+        cos_sin.stride(0),
+        cos_sin.stride(-1),
         *q_out.stride(),
         *k_out.stride(),
         key_cache.stride(0) if not flash_layout else key_cache.stride(0),
@@ -1366,5 +1389,5 @@ def fused_qk_rope_reshape_and_cache(
     )
 
     if zeros_out is not None:
-        return q_out, k_out, key_cache, value_cache, zeros_out
-    return q_out, k_out, key_cache, value_cache
+        return q_out.view(-1, qh * d), k_out, key_cache, value_cache, zeros_out
+    return q_out.view(-1, qh * d), k_out, key_cache, value_cache

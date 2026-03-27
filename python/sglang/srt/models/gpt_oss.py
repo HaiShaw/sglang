@@ -41,9 +41,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.utils import (
-    fused_qk_rope_reshape_and_cache,
-)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -65,7 +62,7 @@ from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -355,7 +352,7 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope_wrapper(
+        self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
@@ -403,25 +400,30 @@ class GptOssAttention(nn.Module):
         if not _is_hip:
             q, k = self.rotary_emb(positions, q, k, **extra_args)
         else:
-            extra_args = extra_args["fused_set_kv_buffer_arg"]
-
-            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-                q=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
-                k=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
-                v=v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim),
-                k_scale=self.attn.k_scale,
-                v_scale=self.attn.v_scale,
-                pos=positions,
-                cos=self.rotary_emb.cos_cache,
-                sin=self.rotary_emb.sin_cache,
-                is_neox=self.rotary_emb.is_neox_style,
-                flash_layout=True,
-                offs=None,
-                q_out=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
-                k_out=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
-                output_zeros=False,
+            q, k = self.rotary_emb(
+                positions,
+                q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
+                k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
                 **extra_args,
             )
+            # extra_args = extra_args["fused_set_kv_buffer_arg"]
+
+            # q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+            #    q=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
+            #    k=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
+            #    v=v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim),
+            #    k_scale=self.attn.k_scale,
+            #    v_scale=self.attn.v_scale,
+            #    pos=positions,
+            #    cos_sin=self.rotary_emb.cos_sin_cache,
+            #    is_neox=self.rotary_emb.is_neox_style,
+            #    flash_layout=True,
+            #    offs=None,
+            #    q_out=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
+            #    k_out=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
+            #    output_zeros=False,
+            #    **extra_args,
+            # )
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state

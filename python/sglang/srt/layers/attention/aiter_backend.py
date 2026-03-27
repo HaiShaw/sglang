@@ -2528,7 +2528,7 @@ class AiterAttnBackend(AttentionBackend):
                     v_descale=v_descale,
                     sinks=sinks,
                 )
-                o = o.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                # o = o.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
             else:
                 if self.kv_cache_dtype == fp8_dtype:
                     k_cache = k_cache.to(self.input_dtype)

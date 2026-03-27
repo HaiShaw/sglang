@@ -40,6 +40,11 @@ if _is_cuda:
 if _is_npu:
     import torch_npu
 
+if _is_hip:
+    from sglang.srt.layers.attention.utils import (
+        fused_qk_rope_reshape_and_cache,
+    )
+
 
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
@@ -287,7 +292,7 @@ class RotaryEmbedding(MultiPlatformOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
@@ -305,18 +310,38 @@ class RotaryEmbedding(MultiPlatformOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-            assert (
-                fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for fallback_rotary_embedding."
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.fallback_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+
+            if fused_set_kv_buffer_arg is not None:
+                extra_args = fused_set_kv_buffer_arg
+
+                query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                    q=query,
+                    k=key,
+                    pos=positions,
+                    cos_sin=self.cos_sin_cache,
+                    is_neox=self.is_neox_style,
+                    flash_layout=True,
+                    offs=None,
+                    q_out=query,
+                    k_out=key,
+                    output_zeros=False,
+                    **extra_args,
+                )
+            else:
+                assert (
+                    fused_set_kv_buffer_arg is None
+                ), "save kv cache is not supported for fallback_rotary_embedding."
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
+                self.fallback_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
         return query, key
 
     def extra_repr(self) -> str:

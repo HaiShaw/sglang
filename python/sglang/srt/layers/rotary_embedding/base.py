@@ -314,6 +314,16 @@ class RotaryEmbedding(MultiPlatformOp):
             if fused_set_kv_buffer_arg is not None:
                 extra_args = fused_set_kv_buffer_arg
 
+                k_cache_shape = fused_set_kv_buffer_arg["key_cache"].shape
+                qk_head_dim = k_cache_shape[-1]
+                tp_k_head_num = k_cache_shape[-2]
+
+                key = key.view(-1, tp_k_head_num, qk_head_dim)
+
+                tokens = key.shape[0]
+
+                query = query.view(tokens, -1, qk_head_dim)
+
                 query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                     q=query,
                     k=key,

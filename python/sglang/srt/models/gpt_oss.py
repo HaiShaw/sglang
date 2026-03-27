@@ -397,16 +397,8 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        if not _is_hip:
-            q, k = self.rotary_emb(positions, q, k, **extra_args)
-        else:
-            q, k = self.rotary_emb(
-                positions,
-                q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
-                k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
-                **extra_args,
-            )
 
+        q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 

@@ -139,22 +139,6 @@ def create_fused_set_kv_buffer_arg(
             cache_loc=forward_batch.out_cache_loc,
         )
     else:
-        # q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-        #    q=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
-        #    k=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
-        #    v=v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim),
-        #    k_scale=self.attn.k_scale,
-        #    v_scale=self.attn.v_scale,
-        #    pos=positions,
-        #    cos_sin=self.rotary_emb.cos_sin_cache,
-        #    is_neox=self.rotary_emb.is_neox_style,
-        #    flash_layout=True,
-        #    offs=None,
-        #    q_out=q.view(-1, self.attn.tp_q_head_num, self.attn.qk_head_dim),
-        #    k_out=k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim),
-        #    output_zeros=False,
-        #    **extra_args,
-        # )
         page_size = token_to_kv_pool.page_size
         slot_mapping_swa = (
             token_to_kv_pool.full_to_swa_index_mapping.long()

@@ -311,7 +311,7 @@ class RotaryEmbedding(MultiPlatformOp):
             )
         else:
 
-            if fused_set_kv_buffer_arg is not None:
+            if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
 
                 k_cache_shape = fused_set_kv_buffer_arg["key_cache"].shape

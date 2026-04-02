@@ -686,6 +686,7 @@ class GroupCoordinator:
                 512,
                 1024,
                 2048,
+                2880,
                 4096,
             }
 

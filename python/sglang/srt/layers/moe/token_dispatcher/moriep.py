@@ -261,10 +261,11 @@ def init_mori_op(
         f"{combine_quant_type=}"
     )
 
+    # Definition refer to https://github.com/ROCm/mori/blob/f9be5ee2e5ac87256b9523399ae9d4d0e8a54f53/python/mori/ops/dispatch_combine.py#L66-L121
     mori_config = mori.ops.EpDispatchCombineConfig(
+        data_type=data_type,
         rank=rank,
         world_size=world_size,
-        data_type=data_type,
         hidden_dim=hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
@@ -274,6 +275,9 @@ def init_mori_op(
         num_experts_per_token=router_topk,
         warp_num_per_block=warp_num_per_block,
         block_num=block_num,
+        max_total_recv_tokens=get_int_env_var(
+            "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
+        ),
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,

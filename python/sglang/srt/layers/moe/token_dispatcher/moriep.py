@@ -19,7 +19,11 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
@@ -264,18 +268,14 @@ def init_mori_op(
     def check_mori_compatibility(kwargs: dict) -> None:
         """Remove kwargs not accepted by the installed mori's EpDispatchCombineConfig."""
         import dataclasses
-        import inspect
 
         config_cls = mori.ops.EpDispatchCombineConfig
-        if dataclasses.is_dataclass(config_cls):
-            valid_keys = {f.name for f in dataclasses.fields(config_cls)}
-        else:
-            valid_keys = set(inspect.signature(config_cls).parameters.keys())
+        valid_kwargs = {f.name for f in dataclasses.fields(config_cls)}
 
-        invalid_keys = set(kwargs.keys()) - valid_keys
-        for key in invalid_keys:
-            logger.warning(f"[MORI compat] Removing incompatible config key '{key}' ")
-            del kwargs[key]
+        invalid_kwargs = set(kwargs.keys()) - valid_kwargs
+        for arg in invalid_kwargs:
+            logger.warning(f"[MORI compat] Removing incompatible argument {arg} ")
+            del kwargs[arg]
 
     # Definition refer to https://github.com/ROCm/mori/blob/f9be5ee2e5ac87256b9523399ae9d4d0e8a54f53/python/mori/ops/dispatch_combine.py#L66-L121
     common_kwargs = dict(

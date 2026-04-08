@@ -261,8 +261,24 @@ def init_mori_op(
         f"{combine_quant_type=}"
     )
 
+    def check_mori_compatibility(kwargs: dict) -> None:
+        """Remove kwargs not accepted by the installed mori's EpDispatchCombineConfig."""
+        import dataclasses
+        import inspect
+
+        config_cls = mori.ops.EpDispatchCombineConfig
+        if dataclasses.is_dataclass(config_cls):
+            valid_keys = {f.name for f in dataclasses.fields(config_cls)}
+        else:
+            valid_keys = set(inspect.signature(config_cls).parameters.keys())
+
+        invalid_keys = set(kwargs.keys()) - valid_keys
+        for key in invalid_keys:
+            logger.warning(f"[MORI compat] Removing incompatible config key '{key}' ")
+            del kwargs[key]
+
     # Definition refer to https://github.com/ROCm/mori/blob/f9be5ee2e5ac87256b9523399ae9d4d0e8a54f53/python/mori/ops/dispatch_combine.py#L66-L121
-    mori_config = mori.ops.EpDispatchCombineConfig(
+    common_kwargs = dict(
         data_type=data_type,
         rank=rank,
         world_size=world_size,
@@ -281,9 +297,13 @@ def init_mori_op(
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=2,
+        num_qp_per_pe=2,  # Number of queue pairs per processing element
         quant_type=combine_quant_type,
     )
+
+    check_mori_compatibility(common_kwargs)
+
+    mori_config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
     return mori_op
 

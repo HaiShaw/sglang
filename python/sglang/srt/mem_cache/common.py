@@ -11,7 +11,9 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import support_triton
+from sglang.srt.utils import is_hip, support_triton
+
+_is_hip = is_hip()
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -130,12 +132,13 @@ def get_last_loc(
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
     if (
-        get_global_server_args().attention_backend != "ascend"
-        and get_global_server_args().attention_backend != "torch_native"
+        get_global_server_args().attention_backend == "ascend"
+        or get_global_server_args().attention_backend == "torch_native"
+        # or _is_hip
     ):
-        impl = get_last_loc_triton
-    else:
         impl = get_last_loc_torch
+    else:
+        impl = get_last_loc_triton
 
     return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
 
@@ -170,7 +173,9 @@ def get_last_loc_kernel(
     req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
 
     token_mask = prefix_lens > 0
-    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    token_index = (req_pool_indices * req_to_token_stride + (prefix_lens - 1)).to(
+        tl.int32
+    )
     tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
 
     tl.store(result + offset, tokens, mask=mask)
@@ -183,7 +188,9 @@ def get_last_loc_triton(
 ) -> torch.Tensor:
     BLOCK_SIZE = 256
     num_tokens = prefix_lens_tensor.shape[0]
-    result = torch.empty_like(prefix_lens_tensor)
+    result = torch.empty(
+        num_tokens, dtype=req_to_token.dtype, device=prefix_lens_tensor.device
+    )
     grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
 
     get_last_loc_kernel[grid](

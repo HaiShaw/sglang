@@ -1790,6 +1790,8 @@ class ServerArgs:
                     is_hip() and get_bool_env_var("SGLANG_USE_AITER")
                 ) and is_mxfp4_quant_format:
                     self.moe_runner_backend = "auto"
+                    # for better performance in using aiter backend attention
+                    self.page_size = 64
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )

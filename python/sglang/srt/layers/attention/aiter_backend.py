@@ -1197,11 +1197,8 @@ class AiterAttnBackend(AttentionBackend):
             max_bs, dtype=torch.int, device=self.device
         )
         if kv_indices_buf is None:
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * max_num_blocks_per_seq),
+                (max_bs * self.max_context_len),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1241,11 +1238,8 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_partial_map = None
 
         if self.use_sliding_window_kv_pool:
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
             self.cuda_graph_swa_page_table = torch.zeros(
-                (max_bs, max_num_blocks_per_seq),
+                (max_bs, self.max_context_len),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1299,11 +1293,8 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     max_q_len = 1
-                    max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
                     kv_indices = self.cuda_graph_kv_indices.view(
-                        -1, max_num_blocks_per_seq
+                        -1, self.max_context_len
                     )
 
                     page_indices = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
@@ -1681,11 +1672,8 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     max_q_len = 1
-                    max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
                     kv_indices = self.cuda_graph_kv_indices.view(
-                        -1, max_num_blocks_per_seq
+                        -1, self.max_context_len
                     )
 
                     page_indices = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
@@ -2517,7 +2505,7 @@ class AiterAttnBackend(AttentionBackend):
                     if self.forward_metadata.swa_page_table is not None:
                         page_table = self.forward_metadata.swa_page_table
 
-                max_kv_len = page_table.shape[1] * self.page_size
+                max_kv_len = page_table.shape[1]
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

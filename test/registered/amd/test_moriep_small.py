@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import wait_port_available
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -14,6 +16,21 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+
+def wait_all_ports_release(base_url):
+    """Wait until all derived ports are fully released."""
+    port = int(base_url.split(":")[-1])
+    for offset in [
+        0,
+        ZMQ_TCP_PORT_DELTA,
+        ZMQ_TCP_PORT_DELTA + 1,
+        ZMQ_TCP_PORT_DELTA + 2,
+        ZMQ_TCP_PORT_DELTA + 3,
+        ZMQ_TCP_PORT_DELTA + 4,
+    ]:
+        wait_port_available(port + offset, f"port-{port + offset}")
+
 
 register_amd_ci(est_time=1200, suite="stage-c-test-large-8-gpu-amd")
 
@@ -84,6 +101,7 @@ class TestPureDP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -128,6 +146,7 @@ class TestMTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -181,6 +200,7 @@ class TestNormal(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -230,6 +250,7 @@ class TestLowLatency(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -278,6 +299,7 @@ class TestTBOwithNormal(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -328,6 +350,7 @@ class TestTBOwithLowLatency(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -380,6 +403,7 @@ class TestMTPwithTBONormal(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -440,6 +464,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,

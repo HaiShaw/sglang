@@ -6,7 +6,7 @@ import requests
 
 from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.network import wait_port_available
+from sglang.srt.utils.network import is_port_available
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -18,18 +18,25 @@ from sglang.test.test_utils import (
 )
 
 
-def wait_all_ports_release(base_url):
+def wait_all_ports_release(base_url, timeout_s=60):
     """Wait until all derived ports are fully released."""
+    import time
+
     port = int(base_url.split(":")[-1])
-    for offset in [
+    offsets = [
         0,
         ZMQ_TCP_PORT_DELTA,
         ZMQ_TCP_PORT_DELTA + 1,
         ZMQ_TCP_PORT_DELTA + 2,
         ZMQ_TCP_PORT_DELTA + 3,
         ZMQ_TCP_PORT_DELTA + 4,
-    ]:
-        wait_port_available(port + offset, f"port-{port + offset}")
+    ]
+    for _ in range(timeout_s):
+        if all(is_port_available(port + off) for off in offsets):
+            return
+        time.sleep(1)
+    # Best-effort: log but don't raise so tearDown doesn't break the next class.
+    print(f"Warning: some ports still occupied after {timeout_s}s")
 
 
 register_amd_ci(est_time=1200, suite="stage-c-test-large-8-gpu-amd")

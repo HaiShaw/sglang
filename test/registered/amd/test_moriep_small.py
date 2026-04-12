@@ -23,13 +23,15 @@ def wait_all_ports_release(base_url, timeout_s=60):
     import time
 
     port = int(base_url.split(":")[-1])
+
+    # See https://github.com/sgl-project/sglang/blob/495ef8ec64b6b937e59cd530ad3150172061a008/python/sglang/srt/server_args.py#L6958-L6969
     offsets = [
-        0,
-        ZMQ_TCP_PORT_DELTA,
-        ZMQ_TCP_PORT_DELTA + 1,
-        ZMQ_TCP_PORT_DELTA + 2,
-        ZMQ_TCP_PORT_DELTA + 3,
-        ZMQ_TCP_PORT_DELTA + 4,
+        0,  # no offset
+        ZMQ_TCP_PORT_DELTA,  # dist_init_port
+        ZMQ_TCP_PORT_DELTA + 1,  # detokenizer_port
+        ZMQ_TCP_PORT_DELTA + 2,  # rpc_port
+        ZMQ_TCP_PORT_DELTA + 3,  # metrics_port
+        ZMQ_TCP_PORT_DELTA + 4,  # scheduler_input_port
     ]
     for _ in range(timeout_s):
         if all(is_port_available(port + off) for off in offsets):

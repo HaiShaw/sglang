@@ -726,7 +726,7 @@ class AiterAttnBackend(AttentionBackend):
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
                         swa_page_table = self._transform_table_1_to_real(swa_page_table)
-                    elif self.page_size > 1:
+                    else:
                         kv_indices = self._transform_table_1_to_real(kv_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
@@ -1326,7 +1326,7 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                    elif self.page_size > 1:
+                    else:
                         page_indices = self._transform_table_1_to_real(page_indices)
                         new_rows = page_indices.shape[0]
                         new_cols = page_indices.shape[1]
@@ -1708,7 +1708,7 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                    elif self.page_size > 1:
+                    else:
                         page_indices = self._transform_table_1_to_real(page_indices)
                         new_rows = page_indices.shape[0]
                         new_cols = page_indices.shape[1]

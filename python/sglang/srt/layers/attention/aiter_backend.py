@@ -1212,7 +1212,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
         self.cuda_graph_kv_last_page_len = torch.ones(
-            max_bs, dtype=torch.int, device=self.device
+            max_bs, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (

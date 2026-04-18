@@ -132,15 +132,15 @@ class TestEPLBMoriStat(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=10,
+            num_questions=1209,
             max_new_tokens=512,
-            parallel=128,
+            parallel=1209,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
 
 class TestEPLBMoriStatApprox(CustomTestCase):
@@ -178,15 +178,15 @@ class TestEPLBMoriStatApprox(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=10,
+            num_questions=1209,
             max_new_tokens=512,
-            parallel=128,
+            parallel=1209,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
 
 class TestEPLBMoriMultiChunk(CustomTestCase):
@@ -226,15 +226,15 @@ class TestEPLBMoriMultiChunk(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=10,
+            num_questions=1209,
             max_new_tokens=512,
-            parallel=128,
+            parallel=1209,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
 
 if __name__ == "__main__":

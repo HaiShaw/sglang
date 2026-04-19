@@ -489,8 +489,9 @@ def update_expert_weights_single_layer(
             # Submit P2P ops in batches to prevent RCCL GPU-side
             # accumulation hangs. All ranks use the same expert_id ranges
             # (based on num_physical_experts) to ensure matching send/recv
-            # pairs land in the same batch.
-            batch_chunk_size = get_int_env_var("SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE", 64)
+            # pairs land in the same batch. Setting batch_chunk_size >=
+            # num_physical_experts disables batching behavior.
+            batch_chunk_size = get_int_env_var("SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE", 32)
             ops_by_expert = {eid: ops for eid, ops in sorted_infos}
             for start in range(0, num_physical_experts, batch_chunk_size):
                 batch_ops = []

@@ -100,7 +100,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="v1.1.0"
+ARG MORI_COMMIT="9e7a0c7446cb1b2df86d04d1d14ff9dab85100d9"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5

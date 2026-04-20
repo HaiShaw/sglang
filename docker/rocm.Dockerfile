@@ -103,7 +103,7 @@ ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG MORI_COMMIT="v1.1.0"
 
 # AMD AINIC apt repo settings
-ARG AINIC_VERSION=1.117.5
+ARG AINIC_VERSION=1.117.5-a-38
 ARG UBUNTU_CODENAME=jammy
 USER root
 
@@ -267,6 +267,9 @@ ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
 RUN python3 -m pip install --no-cache-dir maturin \
+    && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
+           /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
+    && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
@@ -383,8 +386,27 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
   # Only vendor packages are installed here for dlopen (e.g. libionic.so); no compile-time flags needed.
   case "${NIC_BACKEND}" in \
-    # default: mlx5
+    # default: install ainic and bxnt driver
     none) \
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
+      rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
+      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/amdainic.list; \
+      apt-get update && apt-get install -y --no-install-recommends \
+          libionic-dev \
+          ionic-common \
+      ; \
+      rm -rf /var/lib/apt/lists/*; \
+      apt-get update \
+      && apt-get install -y --no-install-recommends ca-certificates curl \
+      && install -m 0755 -d /etc/apt/keyrings \
+      && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+      && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
+      && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
+      && apt-get update \
+      && apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0 \
+      && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/. \
       ;; \
     # AMD NIC
     ainic) \
@@ -399,10 +421,18 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       ;; \
-    # TODO: Add Broadcom bnxt packages/repos here later.
-    # bnxt) \
-    #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
-    #   ;; \
+     bnxt) \
+       echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
+       apt-get update \
+       && apt-get install -y --no-install-recommends ca-certificates curl \
+       && install -m 0755 -d /etc/apt/keyrings \
+       && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+       && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
+       && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
+       && apt-get update \
+       && apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0 \
+       && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/. \
+       ;; \
     *) \
       echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
       exit 2; \

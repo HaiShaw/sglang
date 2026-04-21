@@ -398,8 +398,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
           ionic-common \
       ; \
       rm -rf /var/lib/apt/lists/*; \
-      apt-get update \
-      && apt-get install -y --no-install-recommends ca-certificates curl \
       && install -m 0755 -d /etc/apt/keyrings \
       && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
       && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
@@ -422,7 +420,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       rm -rf /var/lib/apt/lists/*; \
       ;; \
      bnxt) \
-       echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
+       echo "[MORI] Enabling Broadcom BNXT backend"; \
        apt-get update \
        && apt-get install -y --no-install-recommends ca-certificates curl \
        && install -m 0755 -d /etc/apt/keyrings \

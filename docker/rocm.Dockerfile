@@ -5,10 +5,13 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.9-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm720-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm700-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm720-mi35x -f rocm.Dockerfile .
+# remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+# Keep this build-arg for user to select his desired nic support, current choice [ainic, bxnt]
+# if no set this arg, it will auto detection nic support
+#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.9-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.9-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.9-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.9-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"

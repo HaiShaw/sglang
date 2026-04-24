@@ -164,7 +164,7 @@ def get_hf_text_config(config: PretrainedConfig):
 # Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_temp_model(
     model_path: str,
-    model_type: Literal["deepseek_v32", "deepseek_ref"],
+    model_type: Literal["deepseek_v32", "deepseek_v4"],
     architecture: Literal["DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM"],
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
@@ -278,10 +278,10 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if "deepseek_ref" in str(e):
+            if "deepseek_v4" in str(e):
                 config = _load_deepseek_temp_model(
                     model,
-                    model_type="deepseek_ref",
+                    model_type="deepseek_v4",
                     architecture="DeepseekV4ForCausalLM",
                     trust_remote_code=trust_remote_code,
                     revision=revision,

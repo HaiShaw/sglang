@@ -574,7 +574,8 @@ class SchedulerRuntimeCheckerMixin:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        num_reserved = getattr(self.req_to_token_pool, "num_reserved_slots", 0)
+        if len(self.req_to_token_pool.free_slots) + session_req_count + num_reserved != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "

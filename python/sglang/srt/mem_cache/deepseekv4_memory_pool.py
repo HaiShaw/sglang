@@ -533,6 +533,9 @@ class DeepSeekV4TokenToKVPool(KVCache):
         is_speculative = server_args.speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
+    def set_swa_loc(self, loc: torch.Tensor):
+        self.swa_loc = loc
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
 

@@ -673,7 +673,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool()
+        self.init_memory_pool(self.total_gpu_memory)
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()

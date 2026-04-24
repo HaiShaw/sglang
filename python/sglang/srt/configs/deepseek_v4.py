@@ -1,18 +1,15 @@
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import field
+from typing import Any, Dict, List, Optional
 
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-
-@dataclass
 class DeepSeekV4Config(PretrainedConfig):
-    architectures: List[str]
     attention_bias: bool = False
     attention_dropout: float = 0.0
     bos_token_id: int = 0
     eos_token_id: int = 1
+    pad_token_id: Optional[int] = None
     ep_size: int = 1
     first_k_dense_replace: int = 0
     hidden_act: str = "silu"
@@ -41,7 +38,7 @@ class DeepSeekV4Config(PretrainedConfig):
     qk_nope_head_dim: int = 448
     qk_rope_head_dim: int = 64
 
-    quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig)
+    quantization_config: Optional[Dict[str, Any]] = None
 
     rms_norm_eps: float = 1e-6
 

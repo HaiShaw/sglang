@@ -146,7 +146,9 @@ class ReqToTokenPool:
                 (size, max_context_len), dtype=torch.int32, device=device
             )
 
+        # Skip index 0 because SWA cache and KV State don't have padding
         self.free_slots = list(range(1, size))
+        self.num_reserved_slots = 1
 
     def write(self, indices, values):
         self.req_to_token[indices] = values

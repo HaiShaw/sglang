@@ -23,13 +23,15 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
+    can_nsa_cp_split,
+    is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
+)
+from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    is_nsa_enable_prefill_cp,
-    nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
+    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
@@ -2243,8 +2245,8 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> torch.Tensor:
 
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, True, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,

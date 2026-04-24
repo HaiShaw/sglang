@@ -1,5 +1,11 @@
-from . import bench, compare, generate, precision, utils
-from .bench import bench_by_cuda_events, bench_kineto
+from . import compare, generate, precision, utils
+
+try:
+    from . import bench
+    from .bench import bench_by_cuda_events, bench_kineto
+except ImportError:
+    bench = None
+
 from .compare import (
     check_is_allclose,
     check_is_allclose_comparator,

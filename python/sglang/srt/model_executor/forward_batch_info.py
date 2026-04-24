@@ -61,6 +61,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -98,8 +99,8 @@ class ForwardMode(IntEnum):
     # Used in diffusion LLM inference
     DLLM_EXTEND = auto()
 
-    def is_prefill(self):
-        return self.is_extend()
+    def is_prefill(self, include_draft_extend_v2: bool = False):
+        return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
     def is_extend(self, include_draft_extend_v2: bool = False):
         return (
@@ -374,6 +375,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For hisparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod
     def init_new(

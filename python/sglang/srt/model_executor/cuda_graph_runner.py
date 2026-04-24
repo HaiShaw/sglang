@@ -726,11 +726,13 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+            attn_backend.on_after_cuda_graph_warmup_pass()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
@@ -832,6 +834,8 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=forward_batch.out_cache_loc,
+            actual_forward_mode=forward_batch.forward_mode,
         )
 
         # Store fields
@@ -860,6 +864,7 @@ class CudaGraphRunner:
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
+
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

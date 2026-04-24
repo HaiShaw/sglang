@@ -8,6 +8,9 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.indexer_topk_capturer import (
+    get_global_indexer_capturer,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
@@ -66,6 +69,14 @@ class SchedulerOutputProcessorMixin:
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
         req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
+    def maybe_collect_indexer_topk(self: Scheduler, req: Req):
+        """Collect indexer topk for a finished request (layers with indexer)."""
+        req.indexer_topk = get_global_indexer_capturer().get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
@@ -137,11 +148,14 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        self.maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+                        if self.enable_hisparse:
+                            self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -413,6 +427,7 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 self.maybe_collect_routed_experts(req)
+                self.maybe_collect_indexer_topk(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -420,6 +435,8 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                 else:
                     release_kv_cache(req, self.tree_cache)
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(req)
 
                 req.time_stats.completion_time = time.perf_counter()
 
@@ -477,6 +494,11 @@ class SchedulerOutputProcessorMixin:
                 self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
+            )
+
+        if self.enable_hisparse:
+            self.hisparse_coordinator.update_requests_after_decode(
+                [req for req in batch.reqs if not req.finished()]
             )
 
     def _mamba_prefix_cache_update(
@@ -854,6 +876,7 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
+        indexer_topk = None
         routed_experts = None
         customized_info = {}
 
@@ -1054,7 +1077,10 @@ class SchedulerOutputProcessorMixin:
                     if routed_experts is None:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
-
+                if req.return_indexer_topk:
+                    if indexer_topk is None:
+                        indexer_topk = []
+                    indexer_topk.append(req.indexer_topk)
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
@@ -1109,6 +1135,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    indexer_topk=indexer_topk,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

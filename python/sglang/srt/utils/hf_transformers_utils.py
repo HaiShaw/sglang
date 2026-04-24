@@ -20,7 +20,7 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
@@ -69,7 +69,6 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
-from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     AfmoeConfig,
@@ -163,8 +162,10 @@ def get_hf_text_config(config: PretrainedConfig):
 
 
 # Temporary hack for DeepSeek-V3.2 model
-def _load_deepseek_v32_model(
+def _load_deepseek_temp_model(
     model_path: str,
+    model_type: Literal["deepseek_v32", "deepseek_ref"],
+    architecture: Literal["DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM"],
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     **kwargs,
@@ -179,13 +180,13 @@ def _load_deepseek_v32_model(
     with open(config_file, "r") as f:
         config_json = json.load(f)
 
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
+    config_json["architectures"] = [architecture]
     config_json["model_type"] = "deepseek_v3"
 
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
-    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
+    unique_path = os.path.join(tmp_path, f"{model_type}_{os.getpid()}")
     with open(unique_path, "w") as f:
         json.dump(config_json, f)
 
@@ -277,11 +278,26 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if not "deepseek_v32" in str(e):
+            if "deepseek_ref" in str(e):
+                config = _load_deepseek_temp_model(
+                    model,
+                    model_type="deepseek_ref",
+                    architecture="DeepseekV4ForCausalLM",
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif "deepseek_v32" in str(e):
+                config = _load_deepseek_temp_model(
+                    model,
+                    model_type="deepseek_v32",
+                    architecture="DeepseekV3ForCausalLM",
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
 
     if (
         config.architectures is not None
@@ -504,7 +520,7 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
-    tokenizer = patch_tokenizer(tokenizer)
+
     return tokenizer
 
 

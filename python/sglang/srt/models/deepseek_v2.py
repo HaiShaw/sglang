@@ -89,6 +89,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
@@ -291,13 +292,16 @@ class MoEGate(nn.Module):
         quant_config,
         prefix: str = "",
         is_nextn: bool = False,
+        is_hash_moe: bool = False,
+        is_deepseek_v4: bool = False,
     ):
         super().__init__()
         self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
-        if config.topk_method == "noaux_tc":
+
+        if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = (
                 torch.bfloat16
                 if quant_config is not None
@@ -321,18 +325,23 @@ class MoEGate(nn.Module):
         forward_batch: ForwardBatch = None,
     ):
         if use_intel_amx_backend(self):
-            return torch.ops.sgl_kernel.weight_packed_linear(
+            logits = torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
                 self.weight,
                 None,  # bias
                 True,  # is_vnni
             )
+            return logits
 
         if get_global_server_args().enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
-
-        if forward_batch is not None and nsa_use_prefill_cp(forward_batch):
             logits = F.linear(hidden_states, self.weight, None)
+            return logits
+
+        # downstream do not support bf16 output; and for safety let's use the code path same as non-CP firstly
+        # if forward_batch is not None and nsa_use_prefill_cp(forward_batch):
+        #     logits = F.linear(hidden_states, self.weight, None)
+        if False:
+            pass
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
@@ -352,7 +361,10 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, gemm_output_zero_allocator
                 )
             else:
-                logits = F.linear(hidden_states, self.weight, None)
+                # reference implementation convert both to float before compute
+                from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
+
+                logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
 
@@ -367,6 +379,7 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        is_deepseek_v4: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -382,6 +395,13 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+
+        # Special case: For DeepSeek V4 MTP layer, it does not use hash moe
+        if envs.SGLANG_DSV4_MODE.get() == "2604":
+            n_hash_layers = config.num_hash_layers
+        else:
+            n_hash_layers = getattr(config, "n_hash_layers", 0)
+        self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -400,6 +420,8 @@ class DeepseekV2MoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate", prefix),
             is_nextn=is_nextn,
+            is_hash_moe=self.is_hash,
+            is_deepseek_v4=is_deepseek_v4,
         )
 
         # scaling factor for fused shared experts on AMD-platform.
@@ -424,31 +446,51 @@ class DeepseekV2MoE(nn.Module):
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
+            swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-            layer_id=self.layer_id,
-            renormalize=config.norm_topk_prob,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-            fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
-            # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
-            # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
-            output_format=(
-                TopKOutputFormat.STANDARD
-                if (quant_config is None)
-                and (not get_moe_runner_backend().is_flashinfer_trtllm())
-                else None
-            ),
-        )
+        self.use_grouped_topk = config.n_group > config.topk_group
+        # Remove this b/c it seems both field always exists, and config object cannot be `get`
+        # if config.get("topk_group", None) and config.get("n_group", None):
+        #     self.use_grouped_topk = config.n_group > config.topk_group
+        # else:
+        #     self.use_grouped_topk = False
+
+        if self.is_hash and not (is_nextn and is_deepseek_v4):
+            self.topk = HashTopK(
+                topk=config.num_experts_per_tok + self.num_fused_shared_experts,
+                num_experts=config.n_routed_experts,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                vocab_size=config.vocab_size,
+                scoring_func=config.scoring_func,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            )
+        else:
+            self.topk = TopK(
+                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                layer_id=self.layer_id,
+                renormalize=config.norm_topk_prob,
+                use_grouped_topk=self.use_grouped_topk,
+                num_expert_group=config.n_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                topk_group=config.topk_group,
+                scoring_func=config.scoring_func,
+                correction_bias=self.gate.e_score_correction_bias,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
+                # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
+                output_format=(
+                    TopKOutputFormat.STANDARD
+                    if (quant_config is None)
+                    and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                    else None
+                ),
+            )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -535,6 +577,9 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            assert hasattr(self, "shared_experts")
+
     def get_moe_weights(self):
         return [
             x.data
@@ -552,12 +597,16 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
             if (
-                self.alt_stream is not None
+                # NOTE temporarily disable dual stream
+                False
+                and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
@@ -574,9 +623,13 @@ class DeepseekV2MoE(nn.Module):
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
+                    input_ids,
+                    input_ids_global=input_ids_global,
                 )
         else:
-            return self.forward_deepep(hidden_states, forward_batch)
+            return self.forward_deepep(
+                hidden_states, forward_batch, input_ids_global=input_ids_global
+            )
 
     def forward_normal_dual_stream(
         self,
@@ -617,6 +670,8 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -632,7 +687,8 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
+            topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -671,6 +727,12 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
+        # Apply routed_scaling_factor BEFORE dumping moe_expert_output so the
+        # dump semantics match the CUDA path (where scaling is applied inside
+        # fused_experts_impl via moe_sum_reduce). Without this, AMD dumps were
+        # pre-scaling while CUDA dumps were post-scaling, producing a spurious
+        # ~7.7% rel_diff that masked real differences.
+        _skip_scaling = envs.SGLANG_FORCE_TRITON_MOE_FP8.get()
         if (
             not _is_cuda
             and not _use_aiter
@@ -678,6 +740,14 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+        elif (
+            _use_aiter
+            and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            and not _skip_scaling
+        ):
+            final_hidden_states *= self.routed_scaling_factor
+        # For _skip_scaling: scaling was already applied inside
+        # fused_experts_impl's moe_sum_reduce_triton (CUDA-parity path).
         if shared_output is not None:
             final_hidden_states += shared_output
         if (
@@ -751,6 +821,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
@@ -773,6 +844,7 @@ class DeepseekV2MoE(nn.Module):
                         shared_event = self.alt_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
+            topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -780,6 +852,7 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
+                **topk_kwargs,
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

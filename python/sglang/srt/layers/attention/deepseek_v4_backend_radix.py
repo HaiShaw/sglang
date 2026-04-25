@@ -60,14 +60,14 @@ from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import _pad_last_dim
-from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.attention.triton_ops.compressed_metadata import (
     init_compressed_metadata as _init_compressed_metadata_triton,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -297,7 +297,9 @@ class DSV4AttnMetadataRadix:
         idx = slice(cp_rank, None, cp_size)
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
-            assert isinstance(val, torch.Tensor), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            assert isinstance(
+                val, torch.Tensor
+            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
     def init_flashmla_related(self):
@@ -1119,15 +1121,26 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
 
         # Padding is generic (out_cache_loc may be ceil_align'd beyond num_tokens).
         # CP always needs it; non-CP can opt in via SGLANG_DSV4_FIX_ATTN_PADDING.
-        _need_pad = is_nsa_prefill_cp_round_robin_split() or envs.SGLANG_DSV4_FIX_ATTN_PADDING.get()
-        if _need_pad and padded_num_tokens is not None and padded_num_tokens > num_tokens:
+        _need_pad = (
+            is_nsa_prefill_cp_round_robin_split()
+            or envs.SGLANG_DSV4_FIX_ATTN_PADDING.get()
+        )
+        if (
+            _need_pad
+            and padded_num_tokens is not None
+            and padded_num_tokens > num_tokens
+        ):
             pad_size = padded_num_tokens - num_tokens
             seq_lens_casual = torch.nn.functional.pad(
                 # TODO: is pad value 1 ok?
-                seq_lens_casual, (0, pad_size), value=1
+                seq_lens_casual,
+                (0, pad_size),
+                value=1,
             )
             req_pool_indices_repeated = torch.nn.functional.pad(
-                req_pool_indices_repeated, (0, pad_size), value=req_pool_indices_repeated[-1].item()
+                req_pool_indices_repeated,
+                (0, pad_size),
+                value=req_pool_indices_repeated[-1].item(),
             )
 
         return seq_lens_casual, req_pool_indices_repeated

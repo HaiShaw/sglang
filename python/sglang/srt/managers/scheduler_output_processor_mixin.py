@@ -599,11 +599,6 @@ class SchedulerOutputProcessorMixin:
         if req.require_reasoning and think_end_id is not None:
             req.update_reasoning_tokens(next_token_id, think_end_id)
 
-        if self.enable_hisparse:
-            self.hisparse_coordinator.update_requests_after_decode(
-                [req for req in batch.reqs if not req.finished()]
-            )
-
     def _mamba_prefix_cache_update(
         self: Scheduler,
         req: Req,

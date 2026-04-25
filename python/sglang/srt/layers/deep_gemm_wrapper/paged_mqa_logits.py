@@ -1,11 +1,11 @@
-import deep_gemm
-
 from dataclasses import dataclass
 from typing import List, Union
 
+import deep_gemm
 import torch
 
 from sglang.srt.environ import envs
+
 
 @dataclass
 class _PagedMqaLogitsMetadataChunk:
@@ -37,9 +37,15 @@ def get_paged_mqa_logits_metadata_chunked(
     for start in range(0, batch_size, chunk_size):
         end = min(start + chunk_size, batch_size)
         schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens[start:end], block_kv, num_sms,
+            context_lens[start:end],
+            block_kv,
+            num_sms,
         )
-        chunks.append(_PagedMqaLogitsMetadataChunk(start=start, end=end, schedule_meta=schedule_meta))
+        chunks.append(
+            _PagedMqaLogitsMetadataChunk(
+                start=start, end=end, schedule_meta=schedule_meta
+            )
+        )
 
     return _PagedMqaLogitsMetadata(chunks=chunks)
 
@@ -56,18 +62,24 @@ def fp8_paged_mqa_logits_chunked(
 ) -> torch.Tensor:
     if not isinstance(schedule_meta, _PagedMqaLogitsMetadata):
         return deep_gemm.fp8_paged_mqa_logits(
-            q, kv_cache, weights, context_lens, block_table,
-            schedule_meta, max_context_len, clean_logits,
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            schedule_meta,
+            max_context_len,
+            clean_logits,
         )
 
     all_logits = []
     for chunk_meta in schedule_meta.chunks:
         chunk_logits = deep_gemm.fp8_paged_mqa_logits(
-            q[chunk_meta.start:chunk_meta.end],
+            q[chunk_meta.start : chunk_meta.end],
             kv_cache,
-            weights[chunk_meta.start:chunk_meta.end],
-            context_lens[chunk_meta.start:chunk_meta.end],
-            block_table[chunk_meta.start:chunk_meta.end],
+            weights[chunk_meta.start : chunk_meta.end],
+            context_lens[chunk_meta.start : chunk_meta.end],
+            block_table[chunk_meta.start : chunk_meta.end],
             chunk_meta.schedule_meta,
             max_context_len,
             clean_logits,

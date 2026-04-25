@@ -32,7 +32,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import pybase64
 import torch
 import uvloop
 import zmq

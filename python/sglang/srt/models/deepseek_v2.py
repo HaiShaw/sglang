@@ -87,6 +87,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
@@ -95,7 +96,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -162,7 +162,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
-    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+    pass
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
@@ -416,9 +416,7 @@ class DeepseekV2MoE(nn.Module):
             n_hash_layers = config.num_hash_layers
         else:
             n_hash_layers = getattr(config, "n_hash_layers", 0)
-        self.is_hash = layer_id < n_hash_layers and not (
-            is_deepseek_v4 and is_nextn
-        )
+        self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -729,9 +727,7 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global} if self.is_hash else {}
-            )
+            topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -886,9 +882,7 @@ class DeepseekV2MoE(nn.Module):
                         shared_event = self.alt_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global} if self.is_hash else {}
-            )
+            topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
             topk_output = self.topk(
                 hidden_states,
                 router_logits,

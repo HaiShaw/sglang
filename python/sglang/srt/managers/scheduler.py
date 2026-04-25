@@ -195,7 +195,6 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,

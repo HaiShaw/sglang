@@ -4,7 +4,6 @@ import concurrent.futures
 import logging
 import os
 from functools import cached_property
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
@@ -16,7 +15,9 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
@@ -26,12 +27,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-)
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
@@ -54,6 +49,12 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.compress_state import (
     CompressStatePool,
@@ -1891,7 +1892,6 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             assert deepseek_v4_moe_code_path_checker.observed == 0
-
 
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(

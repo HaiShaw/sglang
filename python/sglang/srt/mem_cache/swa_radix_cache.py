@@ -1029,7 +1029,6 @@ class SWARadixCache(BasePrefixCache):
 
         if len(key):
 
-
             # Layout: |--- total_prefix_length ---|--- len(key) ---|
             #         ^                           ^                ^
             #         0              total_prefix_length     total_length

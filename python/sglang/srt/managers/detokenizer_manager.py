@@ -21,6 +21,7 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 

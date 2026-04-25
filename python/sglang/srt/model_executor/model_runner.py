@@ -98,6 +98,11 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
+from sglang.srt.layers.attention.indexer_topk_capturer import (
+    create_indexer_capturer,
+    get_global_indexer_capturer,
+    set_global_indexer_capturer,
+)
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -109,11 +114,6 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.attention.indexer_topk_capturer import (
-    create_indexer_capturer,
-    get_global_indexer_capturer,
-    set_global_indexer_capturer,
-)
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     RoutedExpertsOutput,
@@ -357,7 +357,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
-        self.is_hybrid_swa_compress = getattr(model_config, "is_hybrid_swa_compress", False)
+        self.is_hybrid_swa_compress = getattr(
+            model_config, "is_hybrid_swa_compress", False
+        )
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0

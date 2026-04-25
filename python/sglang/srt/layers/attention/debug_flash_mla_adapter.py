@@ -2,8 +2,9 @@ from typing import Any, Optional
 
 import torch
 
-from sglang.srt.utils import is_hip
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_hip
+
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 

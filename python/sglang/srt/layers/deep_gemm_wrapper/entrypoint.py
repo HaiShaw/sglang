@@ -81,7 +81,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
 
 
 def _ensure_cuda(
-    pair: Tuple[torch.Tensor, torch.Tensor]
+    pair: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return (
         pair[0].cuda() if not pair[0].is_cuda else pair[0],

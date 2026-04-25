@@ -6,7 +6,6 @@ from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import NopeFp8RopeBf1
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
-from sglang.srt.utils import is_hip
 
 
 @triton.jit

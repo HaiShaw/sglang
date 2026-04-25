@@ -519,9 +519,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     self.quant_config.weight_block_size,
                 )
                 layer.weight_scale_inv.format_ue8m0 = True
-                
-            weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
+            weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data

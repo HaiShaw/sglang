@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -28,7 +31,6 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
 )
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor

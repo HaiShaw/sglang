@@ -1,10 +1,8 @@
 import logging
-import weakref
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,

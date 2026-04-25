@@ -18,7 +18,6 @@ from sglang.srt.layers.attention.indexer_topk_capturer import (
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
@@ -402,7 +401,11 @@ class C4IndexerBackend:
 
         # main stream
         self.forward_indexer_compressor(
-            x=x_for_compressor if (is_nsa_enable_prefill_cp() and x_for_compressor is not None) else x,
+            x=(
+                x_for_compressor
+                if (is_nsa_enable_prefill_cp() and x_for_compressor is not None)
+                else x
+            ),
             forward_batch=forward_batch,
             layer_id=c4_indexer.layer_id,
             compressor=c4_indexer.compressor,
@@ -448,7 +451,11 @@ class C4IndexerBackend:
         weights = c4_indexer.compute_weights(x, skip_scale=True)
         weights = fused_scale(weights, c4_indexer.weight_scale, q_scale)
         self.forward_indexer_compressor(
-            x=x_for_compressor if (is_nsa_enable_prefill_cp() and x_for_compressor is not None) else x,
+            x=(
+                x_for_compressor
+                if (is_nsa_enable_prefill_cp() and x_for_compressor is not None)
+                else x
+            ),
             forward_batch=forward_batch,
             layer_id=c4_indexer.layer_id,
             compressor=c4_indexer.compressor,
@@ -488,7 +495,11 @@ class C4IndexerBackend:
         assert isinstance(core_metadata, (PagedCoreMetadata, DSV4AttnMetadataRadix))
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
-        _x_comp = x_for_compressor if (is_nsa_enable_prefill_cp() and x_for_compressor is not None) else x
+        _x_comp = (
+            x_for_compressor
+            if (is_nsa_enable_prefill_cp() and x_for_compressor is not None)
+            else x
+        )
         if enable_multi_stream:
             q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
                 x=x,

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
@@ -575,7 +576,10 @@ class SchedulerRuntimeCheckerMixin:
 
         session_req_count = self._session_held_req_count()
         num_reserved = getattr(self.req_to_token_pool, "num_reserved_slots", 0)
-        if len(self.req_to_token_pool.free_slots) + session_req_count + num_reserved != req_total_size:
+        if (
+            len(self.req_to_token_pool.free_slots) + session_req_count + num_reserved
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "

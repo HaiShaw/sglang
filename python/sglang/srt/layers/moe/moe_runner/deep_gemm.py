@@ -7,7 +7,9 @@ import einops
 import torch
 
 from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -188,7 +190,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states_scale)
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            gateup_output = _apply_swiglu_limit(gateup_output, swiglu_limit=self.swiglu_limit)
+            gateup_output = _apply_swiglu_limit(
+                gateup_output, swiglu_limit=self.swiglu_limit
+            )
             deepseek_v4_moe_code_path_checker.observed += 1
 
         down_input = torch.empty(
@@ -279,22 +283,31 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states_scale)
 
         is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-        assert is_2604b == (self.swiglu_limit is not None), \
-            f"swiglu_limit must be non-None iff submode=2604B (got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={self.swiglu_limit!r})"
+        assert is_2604b == (
+            self.swiglu_limit is not None
+        ), f"swiglu_limit must be non-None iff submode=2604B (got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={self.swiglu_limit!r})"
 
         swiglu_limit_arg: Optional[float] = None
         if is_2604b:
-            assert not _MASKED_GEMM_FAST_ACT, \
-                "DSV4 2604 submode 2604B does not support SGLANG_MASKED_GEMM_FAST_ACT"
-            assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get(), \
-                "DSV4 2604 submode 2604B requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+            assert (
+                not _MASKED_GEMM_FAST_ACT
+            ), "DSV4 2604 submode 2604B does not support SGLANG_MASKED_GEMM_FAST_ACT"
+            assert (
+                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            ), "DSV4 2604 submode 2604B requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
             if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 swiglu_limit_arg = self.swiglu_limit
             else:
-                gateup_output = einops.rearrange(gateup_output, 'grp tok hidden -> (grp tok) hidden')
-                gateup_output = _apply_swiglu_limit(gateup_output, swiglu_limit=self.swiglu_limit)
-                gateup_output = einops.rearrange(gateup_output, '(grp tok) hidden -> grp tok hidden', grp=num_groups)
+                gateup_output = einops.rearrange(
+                    gateup_output, "grp tok hidden -> (grp tok) hidden"
+                )
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+                gateup_output = einops.rearrange(
+                    gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
+                )
                 deepseek_v4_moe_code_path_checker.observed += 1
 
         # Act
@@ -621,8 +634,9 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     if _MASKED_GEMM_FAST_ACT:
-        assert swiglu_limit is None, \
-            "swiglu_limit (DSV4 2604 submode 2604B) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
+        assert (
+            swiglu_limit is None
+        ), "swiglu_limit (DSV4 2604 submode 2604B) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
         return sglang_per_token_group_quant_8bit(
             x=gateup_output,
             dst_dtype=torch.float8_e4m3fn,
@@ -667,8 +681,9 @@ def _varlen_deep_gemm_silu_mul_quant(
         )
         down_input_scale = down_input_scale.transpose(-1, -2)
     else:
-        assert swiglu_limit is None, \
-            "swiglu_limit (DSV4 2604 submode 2604B) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        assert (
+            swiglu_limit is None
+        ), "swiglu_limit (DSV4 2604 submode 2604B) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         down_input_scale = torch.empty(
             (E, N, G),
             device=hidden_states_device,
@@ -687,7 +702,9 @@ def _varlen_deep_gemm_silu_mul_quant(
 
 # TODO: it the weight non-interleaved?
 # TODO: also, is the weight gate first, up later?
-def _apply_swiglu_limit(gateup_output: torch.Tensor, swiglu_limit: float) -> torch.Tensor:
+def _apply_swiglu_limit(
+    gateup_output: torch.Tensor, swiglu_limit: float
+) -> torch.Tensor:
     assert swiglu_limit == 10
 
     num_tokens, hidden_size_x2 = gateup_output.shape

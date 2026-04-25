@@ -12,6 +12,9 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         # backend == "torch"
         import os
+        from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+            dpsk_v4_bf16_sparse_attention_fwd,
+        )
 
         backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
     else:
@@ -31,6 +34,9 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
 
     if backend == "torch":
         return flash_mla_with_kvcache_torch(**kwargs)
+
+    if backend == "tilelang":
+        return dpsk_v4_bf16_sparse_attention_fwd(**kwargs)
 
     if backend == "kernel":
         return flash_mla.flash_mla_with_kvcache(**kwargs)

@@ -421,7 +421,6 @@ class ServerArgs:
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
-    collect_tokens_histogram: bool = False
     prompt_tokens_buckets: Optional[List[str]] = None
     generation_tokens_buckets: Optional[List[str]] = None
     gc_warning_threshold_secs: float = 0.0
@@ -761,6 +760,9 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+
+    # For msProbe
+    msprobe_dump_config: Optional[str] = None
 
     def __post_init__(self):
         """
@@ -3488,6 +3490,7 @@ class ServerArgs:
                 "BailingMoeV2_5ForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
+                "HYV3ForCausalLM",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -4097,6 +4100,15 @@ class ServerArgs:
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
+
+        if self.msprobe_dump_config is not None:
+            logger.warning(
+                "When msProbe is enabled, "
+                "cuda graph is disabled(disable_cuda_graph=True) because msProbe only supports dump in eager mode, "
+                "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
@@ -4880,9 +4892,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--collect-tokens-histogram",
-            action="store_true",
-            default=ServerArgs.collect_tokens_histogram,
-            help="Collect prompt/generation tokens histogram.",
+            action=DeprecatedAction,
+            help="Deprecated. Token histograms are now automatically collected when --enable-metrics is set.",
         )
         bucket_rule = (
             "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
@@ -6576,6 +6587,14 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        # For msProbe
+        parser.add_argument(
+            "--msprobe-dump-config",
+            type=str,
+            default=ServerArgs.msprobe_dump_config,
+            help="The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         )
 
     @classmethod

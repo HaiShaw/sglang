@@ -577,7 +577,8 @@ def _fused_moe_kernel_sequence(
                     expert_ids,
                     down_moe_use_tma,
                     activation,
-                    swiglu_limit=swiglu_limit_for_triton)
+                    swiglu_limit=swiglu_limit_for_triton,
+                )
             else:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:

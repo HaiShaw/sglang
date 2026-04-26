@@ -393,6 +393,8 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures)
             and not self.disable_hybrid_swa_memory
         )
+        self.is_swa_with_compressed_attention = False
+        self.has_attention_sinks = False
 
         if not self.is_hybrid_swa:
             return

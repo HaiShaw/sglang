@@ -559,9 +559,16 @@ def _fused_moe_kernel_sequence(
                     )
                     deepseek_v4_moe_code_path_checker.observed += 1
 
-            if not filter_expert:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
+            if filter_expert and _is_cuda:
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
+                silu_and_mul(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                )
+            elif filter_expert and _is_hip:
                 act_and_mul_triton(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
@@ -570,8 +577,9 @@ def _fused_moe_kernel_sequence(
                     expert_ids,
                     down_moe_use_tma,
                     activation,
-                    swiglu_limit=swiglu_limit_for_triton,
-                )
+                    swiglu_limit=swiglu_limit_for_triton)
+            else:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
@@ -588,18 +596,15 @@ def _fused_moe_kernel_sequence(
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
-            if not filter_expert:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
                 vllm_ops.gelu_and_mul(

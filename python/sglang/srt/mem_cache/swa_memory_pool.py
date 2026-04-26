@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -9,11 +9,13 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 
 _is_npu = is_npu()
 
@@ -239,9 +241,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: Union[SWAKVPool, DeepSeekV4TokenToKVPool],
+        kvcache: Union[SWAKVPool, "DeepSeekV4TokenToKVPool"],
         need_sort: bool,
     ):
+        from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
         assert isinstance(kvcache, (SWAKVPool, DeepSeekV4TokenToKVPool))
         self._size_full = size
         self._size_swa = size_swa

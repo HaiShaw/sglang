@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
@@ -293,6 +292,10 @@ class ModelRunnerKVCacheMixin:
         from sglang.srt.platforms import current_platform
 
         if is_v4_model:
+            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                DeepSeekV4TokenToKVPool,
+            )
+
             dsv4_sizes = self.dsv4_pool_sizes
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,

@@ -621,9 +621,6 @@ class DecodePreallocQueue:
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
-        from sglang.srt.mem_cache.deepseekv4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
 
         if not self.pending_reqs:
             return

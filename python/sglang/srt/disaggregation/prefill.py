@@ -58,7 +58,6 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
-    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)

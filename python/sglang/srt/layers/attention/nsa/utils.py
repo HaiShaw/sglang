@@ -235,7 +235,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
 can_cp_split = can_nsa_cp_split
 
 try:
-    from sglang.srt.layers.utils.cp_utils import (
+    from sglang.srt.layers.utils.cp_utils import (  # noqa: F401
         cp_all_gather_rerange_output,
         cp_split_and_rebuild_data,
         cp_split_and_rebuild_position,
@@ -248,5 +248,6 @@ try:
         prepare_context_parallel_metadata as prepare_input_dp_with_cp_dsa,
     )
 except ImportError:
+
     def prepare_input_dp_with_cp_dsa(*args, **kwargs):
         raise NotImplementedError("prepare_input_dp_with_cp_dsa not available")

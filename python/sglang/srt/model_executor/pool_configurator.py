@@ -328,9 +328,7 @@ class DSv4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = (
-            max_total_num_tokens * self._calculator.bytes_per_full_token
-        )
+        available_bytes = max_total_num_tokens * self._calculator.bytes_per_full_token
         return self.calculate_pool_sizes(int(available_bytes), page_size)
 
 

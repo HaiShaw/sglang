@@ -12,7 +12,9 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

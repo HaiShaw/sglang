@@ -512,7 +512,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def sort_tool_results_by_call_order(
-    messages: List[Dict[str, Any]]
+    messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
     Sort tool_result blocks within user messages by the order of tool_calls

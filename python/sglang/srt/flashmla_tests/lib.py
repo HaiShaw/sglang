@@ -59,7 +59,7 @@ class RawTestParamForDecode:
     """
     "Flattened" test parameters for decoding test
 
-    In our test script, to maintain compatibility with TestParam, we embed decode-only parameters into TestParam.decode, which is not very convinient when construct testcases. So here we have a "flattened" version of test parameters for decoding test.
+    In our test script, to maintain compatibility with TestParam, we embed decode-only parameters into TestParam.decode, which is not very convenient when construct testcases. So here we have a "flattened" version of test parameters for decoding test.
     """
 
     b: int

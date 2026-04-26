@@ -376,7 +376,9 @@ def _load_deepseek_v4_model(
     config_json["architectures"] = ["DeepseekV4ForCausalLM"]
     config_json["model_type"] = "deepseek_v3"
 
-    tmp_dir = os.path.join(tempfile.gettempdir(), "_tmp_config_folder", f"deepseek_v4_{os.getpid()}")
+    tmp_dir = os.path.join(
+        tempfile.gettempdir(), "_tmp_config_folder", f"deepseek_v4_{os.getpid()}"
+    )
     os.makedirs(tmp_dir, exist_ok=True)
     with open(os.path.join(tmp_dir, "config.json"), "w") as f:
         json.dump(config_json, f)
@@ -385,9 +387,19 @@ def _load_deepseek_v4_model(
         tmp_dir, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
 
-    for key in ["rope_theta", "compress_rope_theta", "window_size",
-                 "qk_nope_head_dim", "v_head_dim", "o_lora_rank", "o_groups",
-                 "n_hash_layers", "hc_mult", "hc_sinkhorn_iters", "hc_eps"]:
+    for key in [
+        "rope_theta",
+        "compress_rope_theta",
+        "window_size",
+        "qk_nope_head_dim",
+        "v_head_dim",
+        "o_lora_rank",
+        "o_groups",
+        "n_hash_layers",
+        "hc_mult",
+        "hc_sinkhorn_iters",
+        "hc_eps",
+    ]:
         if key in raw_config and not hasattr(config, key):
             setattr(config, key, raw_config[key])
 

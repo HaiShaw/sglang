@@ -1687,11 +1687,11 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        from transformers import AutoTokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         # V3.2 tokenizer works for the chunk-split streaming test: it already
         # has the DSML special tokens and decodes the test strings losslessly.
-        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):

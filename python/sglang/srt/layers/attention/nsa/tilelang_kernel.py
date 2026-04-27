@@ -26,6 +26,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
+FP8_DTYPE = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 FP32 = "float32"
 INT32 = "int32"
 
@@ -1654,7 +1655,7 @@ def dpsk_v4_bf16_sparse_attention_fwd(
 
     # k cache
     k_bf16 = quant.dequantize_k_cache(
-        k_cache.view(FP8), quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+        k_cache.view(FP8_DTYPE), quant.FP8KVCacheLayout.MODEL1_FP8Sparse
     )
     num_blocks, block_size = k_bf16.shape[0], k_bf16.shape[1]
     seq_len_kv = num_blocks * block_size
@@ -1696,7 +1697,7 @@ def dpsk_v4_bf16_sparse_attention_fwd(
     else:
         # extra k cache
         extra_k_bf16 = quant.dequantize_k_cache(
-            extra_k_cache.view(FP8), quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+            extra_k_cache.view(FP8_DTYPE), quant.FP8KVCacheLayout.MODEL1_FP8Sparse
         )
         num_blocks, block_size = extra_k_bf16.shape[0], extra_k_bf16.shape[1]
         seq_len_kv = num_blocks * block_size

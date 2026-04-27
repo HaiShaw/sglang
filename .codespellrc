@@ -1,3 +1,7 @@
 [codespell]
+<<<<<<< amd/deepseek_v4_0426
 ignore-words-list = ans, als, hel, boostrap, childs, te, vas, hsa, ment, cann, thi, makro, wil, rouge, PRIS, ather, MIS, medias, allready, inout, nd, dOut
+=======
+ignore-words-list = ans, als, hel, boostrap, childs, te, vas, hsa, ment, cann, thi, makro, wil, rouge, PRIS, ather, MIS, medias, allready, inout, nd, fo, visibles
+>>>>>>> main
 skip = *.json, *.jsonl, *.patch, *.txt, *.lock

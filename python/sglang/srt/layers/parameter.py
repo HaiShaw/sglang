@@ -29,12 +29,17 @@ _is_cpu = is_cpu()
 
 
 def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
-    if dtype in (
+    fp8_dtypes = {
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
-    ):
+    }
+    fp8_e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if fp8_e8m0_dtype is not None:
+        fp8_dtypes.add(fp8_e8m0_dtype)
+
+    if dtype in fp8_dtypes:
         return 0
     if dtype in (torch.float16, torch.bfloat16):
         return 1

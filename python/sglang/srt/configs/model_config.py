@@ -150,6 +150,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+        self._apply_inference_config_metadata()
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -314,6 +315,40 @@ class ModelConfig:
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             **kwargs,
         )
+
+    def _apply_inference_config_metadata(self) -> None:
+        """Merge optional serving metadata into the HF config.
+
+        Some checkpoints keep extra inference-only metadata outside the HF
+        config. DeepSeek-V4-Flash uses this to mark routed experts as FP4 while
+        the top-level HF quantization method remains FP8.
+        """
+        inference_config_path = Path(self.model_path) / "inference" / "config.json"
+        if not inference_config_path.is_file():
+            return
+
+        try:
+            with open(inference_config_path) as f:
+                inference_config = json.load(f)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load inference config metadata from %s: %s",
+                inference_config_path,
+                exc,
+            )
+            return
+
+        setattr(self.hf_config, "sglang_inference_config", inference_config)
+
+        expert_dtype = inference_config.get("expert_dtype")
+        if expert_dtype is None:
+            return
+
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+        if isinstance(quantization_config, dict):
+            quantization_config = dict(quantization_config)
+            quantization_config.setdefault("expert_dtype", expert_dtype)
+            self.hf_config.quantization_config = quantization_config
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

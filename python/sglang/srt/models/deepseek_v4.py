@@ -87,6 +87,28 @@ COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
+def _has_fp4_routed_experts(config) -> bool:
+    def _extract(container) -> Optional[str]:
+        if container is None:
+            return None
+        if isinstance(container, dict):
+            return container.get("expert_dtype")
+        # transformers QuantizationConfigMixin and similar config objects
+        if hasattr(container, "to_dict"):
+            try:
+                return container.to_dict().get("expert_dtype")
+            except Exception:
+                pass
+        return getattr(container, "expert_dtype", None)
+
+    expert_dtype = (
+        getattr(config, "expert_dtype", None)
+        or _extract(getattr(config, "quantization_config", None))
+        or _extract(getattr(config, "sglang_inference_config", None))
+    )
+    return isinstance(expert_dtype, str) and expert_dtype.lower() == "fp4"
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -2211,9 +2233,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        ):
+        elif _has_fp4_routed_experts(self.config):
             disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
@@ -2416,7 +2436,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604"
             and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         ):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.get():
+            if _has_fp4_routed_experts(self.config):
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 # Converted FP8 checkpoint: wo_a is already bf16; drop stale wo_a.scale if present

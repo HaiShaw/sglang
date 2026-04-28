@@ -608,28 +608,19 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     comm_stream.wait_stream(compute_stream)
 
-                if not self.enable_sdma:
-                    (
-                        packed_recv_hidden,
-                        recv_topk_weights,
-                        recv_scales,
-                        recv_topk_ids,
-                        packed_recv_count,
-                    ) = self.mori_op.dispatch(
-                        hidden_states, topk_weights, scale, topk_ids
-                    )
-
-                else:
-
-                    (
-                        packed_recv_hidden,
-                        recv_topk_weights,
-                        recv_scales,
-                        recv_topk_ids,
-                        packed_recv_count,
-                    ) = self.mori_op.dispatch_send(
-                        hidden_states, topk_weights, scale, topk_ids
-                    )
+                dispatch_fn = (
+                    self.mori_op.dispatch_send
+                    if self.enable_sdma
+                    else self.mori_op.dispatch
+                )
+                (
+                    packed_recv_hidden,
+                    recv_topk_weights,
+                    recv_scales,
+                    recv_topk_ids,
+                    packed_recv_count,
+                ) = dispatch_fn(hidden_states, topk_weights, scale, topk_ids)
+                if self.enable_sdma:
                     self.mori_op.dispatch_recv()
 
                 if self.async_finish:
@@ -710,14 +701,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     comm_stream.wait_stream(compute_stream)
 
-                if not self.enable_sdma:
-                    combined_hidden_states = self.mori_op.combine(
-                        hidden_states, None, topk_ids
-                    )[0]
-                else:
-                    combined_hidden_states = self.mori_op.combine_send(
-                        hidden_states, None, topk_ids
-                    )[0]
+                combine_fn = (
+                    self.mori_op.combine_send
+                    if self.enable_sdma
+                    else self.mori_op.combine
+                )
+                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                if self.enable_sdma:
                     self.mori_op.combine_recv()
 
                 if self.async_finish:

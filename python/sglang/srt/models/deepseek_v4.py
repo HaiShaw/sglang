@@ -88,10 +88,23 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 def _has_fp4_routed_experts(config) -> bool:
-    quantization_config = getattr(config, "quantization_config", None) or {}
-    inference_config = getattr(config, "sglang_inference_config", None) or {}
-    expert_dtype = quantization_config.get("expert_dtype") or inference_config.get(
-        "expert_dtype"
+    def _extract(container) -> Optional[str]:
+        if container is None:
+            return None
+        if isinstance(container, dict):
+            return container.get("expert_dtype")
+        # transformers QuantizationConfigMixin and similar config objects
+        if hasattr(container, "to_dict"):
+            try:
+                return container.to_dict().get("expert_dtype")
+            except Exception:
+                pass
+        return getattr(container, "expert_dtype", None)
+
+    expert_dtype = (
+        getattr(config, "expert_dtype", None)
+        or _extract(getattr(config, "quantization_config", None))
+        or _extract(getattr(config, "sglang_inference_config", None))
     )
     return isinstance(expert_dtype, str) and expert_dtype.lower() == "fp4"
 

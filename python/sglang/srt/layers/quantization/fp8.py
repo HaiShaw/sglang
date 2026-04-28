@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
+import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -112,7 +115,7 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_gfx95 = is_gfx95_supported()
 
 
 def _use_aiter_moe() -> bool:
@@ -129,14 +132,37 @@ def _require_fp4_dtype():
     return fp4_dtype
 
 
+# Per-thread flag that toggles split-K forcing only while a DSV4 FP4 MoE call
+# is on the call stack. Kept as a thread-local so concurrent AITER MoE calls
+# from other paths are not affected.
+_fp4_ksplit_state = threading.local()
+
+
+def _force_fp4_ksplit_active() -> bool:
+    return getattr(_fp4_ksplit_state, "active", False)
+
+
+@contextlib.contextmanager
+def _force_fp4_ksplit():
+    prev = getattr(_fp4_ksplit_state, "active", False)
+    _fp4_ksplit_state.active = True
+    try:
+        yield
+    finally:
+        _fp4_ksplit_state.active = prev
+
+
 def _patch_aiter_fp4_moe_ksplit():
     """Force split-K only while SGLang is invoking DSV4 FP4 MoE.
 
     AITER's default heuristic can pick ksplit=0 for large prefill batches and
     fall through to a CK path that is not reliable for the DSV4 FP4 expert shape.
-    Keep the patch gated by a module flag so other AITER MoE calls are unchanged.
+    The patch wraps AITER's already-cached ``get_ksplit`` with a thin shim that
+    only bumps the result when ``_force_fp4_ksplit`` is active, so other AITER
+    MoE calls are unchanged. We deliberately do NOT add an outer ``lru_cache``
+    here: caching the wrapper would freeze the active-flag check at first
+    miss and leak the FP4 result back to non-FP4 callers (and vice versa).
     """
-    import functools
     import aiter.fused_moe as aiter_fused_moe
 
     if getattr(aiter_fused_moe, "_sglang_fp4_ksplit_patch", False):
@@ -147,24 +173,31 @@ def _patch_aiter_fp4_moe_ksplit():
     @functools.wraps(original_get_ksplit)
     def patched_get_ksplit(token, topk, expert, inter_dim, model_dim):
         ksplit = original_get_ksplit(token, topk, expert, inter_dim, model_dim)
-        if getattr(aiter_fused_moe, "_sglang_force_fp4_ksplit", False):
+        if _force_fp4_ksplit_active():
             return max(ksplit, 2)
         return ksplit
 
-    aiter_fused_moe.get_ksplit = functools.lru_cache(maxsize=2048)(
-        patched_get_ksplit
-    )
+    # Drop any pre-patch cached values so subsequent lookups go through the shim.
+    if hasattr(original_get_ksplit, "cache_clear"):
+        original_get_ksplit.cache_clear()
+    aiter_fused_moe.get_ksplit = patched_get_ksplit
     if hasattr(aiter_fused_moe.get_2stage_cfgs, "cache_clear"):
         aiter_fused_moe.get_2stage_cfgs.cache_clear()
     aiter_fused_moe._sglang_fp4_ksplit_patch = True
-    aiter_fused_moe._sglang_force_fp4_ksplit = False
     return aiter_fused_moe
+
+
+e8m0_shuffle = None  # populated below when AITER is available
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
-    from aiter.utility.fp4_utils import e8m0_shuffle
+
+    try:
+        from aiter.utility.fp4_utils import e8m0_shuffle
+    except ImportError:  # older AITER without FP4 utilities
+        pass
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1169,6 +1202,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "DeepSeek-V4 FP4 experts require ROCm AITER MoE. Set "
                     "SGLANG_USE_AITER=1 and SGLANG_FORCE_TRITON_MOE_FP8=0."
                 )
+            if e8m0_shuffle is None:
+                raise RuntimeError(
+                    "DeepSeek-V4 FP4 experts require aiter.utility.fp4_utils."
+                    "e8m0_shuffle; please update AITER."
+                )
 
             fp4_weight_dtype = _require_fp4_dtype()
             for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
@@ -1181,7 +1219,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-            is_shuffled = _is_shuffle_moe_mxfp4
+            is_shuffled = _is_gfx95
             if is_shuffled:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
@@ -1963,32 +2001,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 deepseek_v4_moe_code_path_checker.observed += 1
+
+            expert_mask = layer.dispatcher.expert_mask_gpu
+
             if self.block_quant:
-                quant_type = (
-                    QuantType.per_1x32
-                    if self.is_fp4_expert
-                    else QuantType.per_128x128
-                )
-                w13_weight = layer.w13_weight
-                w2_weight = layer.w2_weight
                 if self.is_fp4_expert:
-                    fp4_weight_dtype = _require_fp4_dtype()
-                    w13_weight = w13_weight.view(fp4_weight_dtype)
-                    w2_weight = w2_weight.view(fp4_weight_dtype)
-                    if getattr(layer.w13_weight, "is_shuffled", False):
-                        w13_weight.is_shuffled = True
-                        w2_weight.is_shuffled = True
-                if self.is_fp4_expert:
-                    aiter_fused_moe = _patch_aiter_fp4_moe_ksplit()
-                    old_force_ksplit = getattr(
-                        aiter_fused_moe, "_sglang_force_fp4_ksplit", False
-                    )
-                    aiter_fused_moe._sglang_force_fp4_ksplit = True
-                    try:
+                    # Weights were already viewed to fp4 in
+                    # process_weights_after_loading_block_quant; pass through
+                    # AITER's split-K shim so DSV4 FP4 expert shapes get
+                    # ksplit >= 2 only for this call.
+                    _patch_aiter_fp4_moe_ksplit()
+                    quant_type = QuantType.per_1x32
+                    with _force_fp4_ksplit():
                         return fused_moe(
                             x,
-                            w13_weight,
-                            w2_weight,
+                            layer.w13_weight,
+                            layer.w2_weight,
                             topk_weights,
                             topk_ids,
                             w1_scale=layer.w13_weight_scale_inv,
@@ -1999,23 +2027,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                 if activation == "silu"
                                 else ActivationType.Gelu
                             ),
+                            expert_mask=expert_mask,
                         )
-                    finally:
-                        aiter_fused_moe._sglang_force_fp4_ksplit = old_force_ksplit
                 return fused_moe(
                     x,
-                    w13_weight,
-                    w2_weight,
+                    layer.w13_weight,
+                    layer.w2_weight,
                     topk_weights,
                     topk_ids,
                     w1_scale=layer.w13_weight_scale_inv,
                     w2_scale=layer.w2_weight_scale_inv,
-                    quant_type=quant_type,
+                    quant_type=QuantType.per_128x128,
                     activation=(
                         ActivationType.Silu
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
+                    expert_mask=expert_mask,
                 )
             else:
                 return fused_moe(
@@ -2032,6 +2060,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
+                    expert_mask=expert_mask,
                 )
         return None
 

@@ -477,6 +477,8 @@ class DeepseekV2MoE(nn.Module):
             gemm1_clamp_limit=swiglu_limit,
         )
 
+        self.use_grouped_topk = config.n_group > config.topk_group
+
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK
 
@@ -494,10 +496,11 @@ class DeepseekV2MoE(nn.Module):
                 top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
                 layer_id=self.layer_id,
                 renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
+                use_grouped_topk=self.use_grouped_topk,
                 num_expert_group=config.n_group,
                 num_fused_shared_experts=self.num_fused_shared_experts,
                 topk_group=config.topk_group,
+                scoring_func=config.scoring_func,
                 correction_bias=self.gate.e_score_correction_bias,
                 quant_config=quant_config,
                 routed_scaling_factor=self.routed_scaling_factor,

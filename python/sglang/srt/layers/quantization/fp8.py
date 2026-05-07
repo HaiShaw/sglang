@@ -1730,6 +1730,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             elif (
                 _is_hip
+                and _use_aiter_moe()
                 and (_use_aiter or _use_hip_int4)
                 and get_moe_a2a_backend().is_none()
             ):
@@ -2013,7 +2014,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         no_combine: bool = False,
     ) -> Optional["AiterMoeQuantInfo"]:
-        if not (_use_aiter or _use_hip_int4):
+        if not (_use_aiter or _use_hip_int4 or _use_aiter_moe()):
             return None
         assert not no_combine, f"{no_combine=} is not supported."
 

@@ -201,6 +201,7 @@ class DeepseekV2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        swiglu_limit: Optional[float] = None,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> None:
@@ -240,6 +241,7 @@ class DeepseekV2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.swiglu_limit = swiglu_limit
 
     def forward(
         self,
@@ -263,11 +265,25 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+
+        if self.swiglu_limit is not None:
+            x = self.act_fn(gate_up)
+
+        else:
+            dtype = x.dtype
+            combined = gate_up.float()  # [num_tokens, 2*inter_dim_per_tp]
+            gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
+            if self.swiglu_limit > 0:
+                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                gate = torch.clamp(gate, max=self.swiglu_limit)
+            x = F.silu(gate) * up  # [num_tokens, inter_dim_per_tp]
+            x = x.to(dtype)
+
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
+
         return x
 
 
@@ -466,6 +482,7 @@ class DeepseekV2MoE(nn.Module):
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
+            swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
 
@@ -523,6 +540,7 @@ class DeepseekV2MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
@@ -782,6 +800,7 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+
         if shared_output is not None:
             final_hidden_states += shared_output
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(

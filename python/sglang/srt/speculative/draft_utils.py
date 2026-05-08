@@ -208,6 +208,7 @@ class DraftBackendFactory:
         )
 
     def _create_dsv4_decode_backend(self):
+        # TODO [AMD-DSV4]
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4MultiStepBackend,
         )

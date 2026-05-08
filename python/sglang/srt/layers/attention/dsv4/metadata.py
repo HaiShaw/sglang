@@ -95,6 +95,34 @@ def copy_metadata(
 
 
 @dataclass
+class CoreMetadata:
+    positions: torch.Tensor  # needed for sliding window and others
+    # NOTE: swa_out_loc only applies to indices that needs to be written
+    # to the swa_kv_pool. For prefill, we will take a slicing Tensor
+    # that selects the k/v values that needs to be written.
+    swa_slice: Optional[torch.Tensor]
+    swa_out_loc_sliced: torch.Tensor
+    # NOTE: c4/c128 out_loc will mask the invalid write locations to 0.
+    # When no compression happens, out_loc will be 0, which is the "padded slot"
+    c4_out_loc: torch.Tensor
+    c128_out_loc: torch.Tensor
+
+    def init_swa_slice(self, swa_slice: torch.Tensor):
+        assert self.swa_slice is None, "can only update once"
+        self.swa_slice = swa_slice
+        self.swa_out_loc_sliced = self.swa_out_loc_sliced[swa_slice]
+
+    def copy_(self, other):
+        raise NotImplementedError
+
+
+@dataclass
+class IndexerMetadata:
+    def copy_(self, other):
+        raise NotImplementedError
+
+
+@dataclass
 class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
@@ -157,6 +185,85 @@ class PagedIndexerMetadata:
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
         )
+
+
+# TODO [AMD-DSV4]
+@dataclass
+class PagedCoreMetadata(CoreMetadata):
+    page_table: torch.Tensor
+    # sliding window attention (core)
+    swa_page_indices: torch.Tensor  # at most (sum_qo_len, 128)
+    swa_topk_lengths: torch.Tensor  # clipped to 128
+    # C128 dense attention (core)
+    c128_page_indices: torch.Tensor
+    c128_topk_lengths_clamp1: torch.Tensor
+    # C4 sparse attention (core)
+    c4_topk_lengths_raw: torch.Tensor
+    c4_topk_lengths_clamp1: torch.Tensor  # i.e. c4_seq_lens
+    c4_sparse_topk: int  # must be 512
+    c4_sparse_topk_lengths: torch.Tensor = field(init=False)  # clipped to 512
+    c4_sparse_page_indices: torch.Tensor = field(init=False)  # (bs, 512)
+
+    def __post_init__(self):
+        assert self.c4_sparse_topk == 512
+        self.c4_sparse_topk_lengths = torch.clamp(
+            self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+        )
+        self.c4_sparse_page_indices = torch.full(
+            (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
+            -1,
+            dtype=torch.int32,
+            device=self.c4_topk_lengths_clamp1.device,
+        )
+
+    def copy_(self, other: PagedCoreMetadata) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=["c4_sparse_topk", "swa_slice"],
+            copy_fields=[
+                "positions",
+                "swa_out_loc_sliced",
+                "c4_out_loc",
+                "c128_out_loc",
+                "page_table",
+                "swa_page_indices",
+                "swa_topk_lengths",
+                "c128_page_indices",
+                "c128_topk_lengths_clamp1",
+                "c4_topk_lengths_raw",
+                "c4_topk_lengths_clamp1",
+                "c4_sparse_topk_lengths",
+                "c4_sparse_page_indices",
+            ],
+        )
+
+
+# TODO: implement the ragged metadata
+
+
+@dataclass
+class RaggedCoreMetadata(CoreMetadata):
+    swa_ragged_indices: torch.Tensor
+    swa_c4_ragged_indices: torch.Tensor
+    swa_c128_ragged_indices: torch.Tensor
+
+
+@dataclass
+class RaggedIndexerMetadata(IndexerMetadata):
+    c4_k_start: torch.Tensor
+    c4_k_finish: torch.Tensor
+
+
+@dataclass
+class DeepseekV4Metadata:
+    core_metadata: CoreMetadata
+    indexer_metadata: IndexerMetadata
+    debug_seq_lens_expanded: torch.Tensor
+
+    def copy_(self, other: "DeepseekV4Metadata"):
+        self.core_metadata.copy_(other.core_metadata)
+        self.indexer_metadata.copy_(other.indexer_metadata)
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

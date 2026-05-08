@@ -5,9 +5,10 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import get_device_capability, is_musa
+from sglang.srt.utils import get_device_capability, is_hip, is_musa
 
 _is_musa = is_musa()
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +95,19 @@ def create_nsa_backend(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-    )
 
-    return DeepseekV4AttnBackend(runner)
+    if not _is_hip:
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        return DeepseekV4AttnBackend(runner)
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_amd_backend import (
+            DeepseekV4Backend,
+        )
+
+        return DeepseekV4Backend(runner)
 
 
 @register_attention_backend("triton")

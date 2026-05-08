@@ -78,9 +78,14 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-    )
+    if not _is_hip:
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_amd_backend import (
+            DeepseekV4Backend as DeepseekV4AttnBackend,
+        )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
@@ -846,7 +851,7 @@ class DeepseekV4Model(nn.Module):
         )
         self.rms_norm_eps = config.rms_norm_eps
         self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
+            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda) else None
         )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

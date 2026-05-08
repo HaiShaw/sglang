@@ -23,8 +23,17 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
 
+_is_hip = is_hip()
+
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    if not _is_hip:
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_amd_backend import (
+            DeepseekV4Backend as DeepseekV4AttnBackend,
+        )
     from sglang.srt.layers.attention.dsv4.compressor import (
         CompressorBackendMixin,
     )

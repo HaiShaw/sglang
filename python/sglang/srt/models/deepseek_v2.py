@@ -477,7 +477,9 @@ class DeepseekV2MoE(nn.Module):
             gemm1_clamp_limit=swiglu_limit,
         )
 
-        self.use_grouped_topk = config.n_group > config.topk_group
+        self.use_grouped_topk = (
+            False if is_deepseek_v4 else config.n_group > config.topk_group
+        )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK

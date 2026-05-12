@@ -1,6 +1,6 @@
 export SGLANG_OPT_USE_OLD_COMPRESSOR=true
 export SGLANG_OPT_USE_TILELANG_SWA_PREPARE=false
-export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=false
+export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=true
 
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
 
@@ -30,10 +30,10 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
 
-MODEL=/dockerx/data/deepseek-ai/DeepSeek-V4-Pro
-#MODEL=/dockerx/data/sgl-project/DeepSeek-V4-Flash-FP8/
+MODEL=/data/models/DeepSeek-V4-Pro
+#MODEL=/data/models/DeepSeek-V4-Flash-FP8/
 
-python3 -m sglang.launch_server \
+PYTHONPATH=/xinyi/sglang-hai/python:${PYTHONPATH:-} python3 -m sglang.launch_server \
     --model-path ${MODEL} \
     --trust-remote-code \
     --tp 8 \

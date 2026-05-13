@@ -30,8 +30,8 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
 
-MODEL=/data/models/DeepSeek-V4-Pro
-#MODEL=/data/models/DeepSeek-V4-Flash-FP8/
+MODEL=/dockerx/data/deepseek-ai/DeepSeek-V4-Pro
+#MODEL=/dockerx/data/sgl-project/DeepSeek-V4-Flash-FP8/
 
 PYTHONPATH=/xinyi/sglang-hai/python:${PYTHONPATH:-} python3 -m sglang.launch_server \
     --model-path ${MODEL} \

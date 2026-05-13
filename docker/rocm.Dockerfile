@@ -202,11 +202,15 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 
+# cherry pick:
+#   - ae80f53: optimized topk_gating kernel with sigmoid/softmax support (PR #3100)
+# may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
+ && git cherry-pick --no-commit ae80f53b837551a4f7a505e413928aa16d6dcb8d \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 

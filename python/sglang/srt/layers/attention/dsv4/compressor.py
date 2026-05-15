@@ -150,7 +150,11 @@ class CompressorBackendMixin:
         if is_paged:
             metadata = self.get_paged_compress_metadata(compress_ratio)
             coff = 2 if is_overlap_compress(compress_ratio) else 1
-            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            if (
+                not _is_hip
+                and compress_ratio == 128
+                and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            ):
                 kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
             else:
                 last_dim = 2 * head_dim * coff
@@ -160,6 +164,41 @@ class CompressorBackendMixin:
             plan = make_compressor_plan(compress_ratio, forward_batch)
             metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
         indices, extra_data, plan = metadata
+
+        if _is_hip:
+            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                raise NotImplementedError(
+                    "HIP fused compressor does not support online c128 metadata"
+                )
+            if not is_paged:
+                raise NotImplementedError("HIP fused compressor expects paged metadata")
+
+            from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+                hip_compress_forward,
+                hip_compress_fused_norm_rope_inplace,
+            )
+
+            kv_compressed = hip_compress_forward(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=ape,
+                indices=indices,
+                plan=plan,
+                compress_ratio=compress_ratio,
+                head_dim=head_dim,
+                extra_data=extra_data,
+            )
+            norm_eps = (
+                norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
+            )
+            hip_compress_fused_norm_rope_inplace(
+                kv_compressed,
+                norm.weight,
+                norm_eps,
+                freqs_cis_cache,
+                plan,
+            )
+            return rotate_activation(kv_compressed) if rotate else kv_compressed
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -349,6 +388,8 @@ def create_paged_compressor_data(
         if is_overlap:
             write_overlap_loc = get_raw_loc(write_positions - compress_ratio)
             extra_data = write_overlap_loc.view(-1, 1)
+        elif _is_hip:
+            extra_data = get_raw_loc(write_positions - compress_ratio)
         else:
             extra_data = None
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
@@ -429,7 +470,7 @@ class Compressor(nn.Module):
     @cached_property
     def use_fused_compress(self) -> bool:
         if _is_hip:
-            return False
+            return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
         if (
             envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get()
             and envs.SGLANG_OPT_DPSK_V4_RADIX.get()
@@ -773,7 +814,11 @@ class Compressor(nn.Module):
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.use_fused_compress:
+        if self.use_fused_compress and (
+            not _is_hip
+            or forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             return self.compress_fused(kv_score, forward_batch)
 
         self.compress_decode = self.compress_decode_paged

@@ -49,7 +49,9 @@ def _c4_decode_kernel(
     write_slot = (seq_len + 3) % 4
 
     in_base = bid.to(tl.int64) * kv_in_row_stride
-    page_base = index * buffer_page_stride + write_slot.to(tl.int64) * buffer_slot_stride
+    page_base = (
+        index * buffer_page_stride + write_slot.to(tl.int64) * buffer_slot_stride
+    )
 
     # Keep the paged state pool up to date even when this token is not a
     # compression boundary.
@@ -78,7 +80,9 @@ def _c4_decode_kernel(
         write_pos = ((seq_len - 1) // 4) * 4
         page = tl.where(src_pos < write_pos, index_prev, index)
         slot_in_page = src_pos % 4
-        slot_base = page * buffer_page_stride + slot_in_page.to(tl.int64) * buffer_slot_stride
+        slot_base = (
+            page * buffer_page_stride + slot_in_page.to(tl.int64) * buffer_slot_stride
+        )
         valid = src_pos >= 0
         if slot == 7:
             kv = tl.load(
@@ -306,7 +310,9 @@ def _c128_decode_kernel(
         write_pos = ((seq_len - 1) // 128) * 128
         pages = tl.where(src_pos < write_pos, index_prev, index)
         slot_in_page = src_pos % 128
-        slot_bases = pages * buffer_page_stride + slot_in_page.to(tl.int64) * buffer_slot_stride
+        slot_bases = (
+            pages * buffer_page_stride + slot_in_page.to(tl.int64) * buffer_slot_stride
+        )
         kv_tile = tl.load(
             buffer_ptr + slot_bases[:, None] + d_offs[None, :],
             mask=valid[:, None] & (~is_input)[:, None] & d_mask[None, :],
@@ -392,7 +398,9 @@ def _c128_prefill_compress_kernel(
         is_state = slot_offs < window_len
         src_pos = position - 127 + slot_offs
         state_valid = is_state & (src_pos >= 0)
-        slot_bases = index * buffer_page_stride + slot_offs.to(tl.int64) * buffer_slot_stride
+        slot_bases = (
+            index * buffer_page_stride + slot_offs.to(tl.int64) * buffer_slot_stride
+        )
         in_rows = ragged_id - (127 - slot_offs)
         in_rows_safe = tl.where(is_state, tl.zeros_like(in_rows), in_rows)
         in_bases = in_rows_safe.to(tl.int64) * kv_in_row_stride

@@ -529,7 +529,20 @@ class DeepseekMLAForwardMixin:
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+            and (
+                not _use_aiter
+                or not _is_gfx95_supported
+                or self.use_dsa
+                # Non-fused, non-specialized attention backends (e.g. Triton) run
+                # the cat path in forward_absorb_core and need RoPE applied here;
+                # only the aiter fused MLA path and the specialized MLA backends
+                # defer RoPE to their own kernels.
+                or (
+                    self.current_attention_backend
+                    not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+                    and self.current_attention_backend != "aiter"
+                )
+            )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -726,7 +739,14 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
         else:
-            if _use_aiter_gfx95:
+            # The fused rope+cache kernel writes K/V straight into the paged KV
+            # buffer and returns an *empty* k tensor, relying on the attention
+            # backend to read all K/V from that buffer. Only the aiter attention
+            # backend does so; backends like Triton use a 2-stage extend kernel
+            # that reads the current chunk's K from the returned k, so feeding
+            # them an empty k causes an out-of-bounds GPU memory access. Restrict
+            # the fused path to the aiter backend accordingly.
+            if _use_aiter_gfx95 and self.current_attention_backend == "aiter":
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -995,12 +1015,14 @@ class DeepseekMLAForwardMixin:
         Skip rope in prepare and let the fused kernel in forward_absorb_core handle it,
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
         that calls fused_qk_rope_cat_and_cache_mla).
+
+        This is only valid for the aiter attention backend, whose attention kernel reads
+        all K/V (prefix + current) from the paged KV buffer that the fused kernel writes
+        into. Other non-fused backends (e.g. Triton) run the cat path in
+        forward_absorb_core and still need an explicit, RoPE-applied K, so they must NOT
+        skip RoPE here.
         """
-        return (
-            _use_aiter_gfx95
-            and self.current_attention_backend
-            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
-        )
+        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
 
 
 # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`

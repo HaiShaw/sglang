@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(_HAS_CUDA, "Triton kernels require CUDA")

@@ -158,10 +158,7 @@ from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
-from sglang.srt.managers.prefill_delayer import (
-    PrefillDelayer,
-    PrefillDelayerSinglePassExecutor,
-)
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -1061,8 +1058,7 @@ class Scheduler(
                         if self.metrics_reporter.enable_metrics
                         else None
                     ),
-                    max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
-                    token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
+                    max_prefill_tokens=self.max_prefill_tokens,
                     device=self.tp_group.device,
                 )
 
@@ -2793,29 +2789,64 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
-        prefill_delayer_single_pass = None
-        if self.prefill_delayer:
-            # Get max usage across all pools for prefill delay decision
-            max_pool_usage = (
-                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
-            )
-            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=max_pool_usage
-            )
+        # Prefill coalescer (ATOM-style). MUST run every tick on every DP rank
+        # (it does a cross-DP all_gather) so ranks stay in lockstep -- hence
+        # before any early-return inside _get_new_batch_prefill_raw. A veto here
+        # holds prefill admission this tick and falls through to decode.
+        if self.prefill_delayer is not None:
+            if not self.prefill_delayer.should_allow_prefill(
+                **self._prefill_delayer_inputs(running_batch)
+            ):
+                return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         ret, running_batch = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
+            running_batch=running_batch
         )
-
-        if self.prefill_delayer:
-            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _prefill_delayer_inputs(self, running_batch: ScheduleBatch) -> dict:
+        """Snapshot this rank's local coalescer signals for should_allow_prefill."""
+        running_bs = len(running_batch.reqs)
+        can_alloc = self.get_num_allocatable_reqs(running_bs) > 0
+        prefillable = (
+            len(self.waiting_queue) > 0 and can_alloc
+        ) or self.chunked_req is not None
+
+        # pending = fresh waiting new-tokens + resumable partial's remaining,
+        # capped at the per-forward token budget: the coalescer's fill signal.
+        pending_tokens = sum(len(r.origin_input_ids) for r in self.waiting_queue)
+        if self.chunked_req is not None:
+            pending_tokens += max(
+                0,
+                len(self.chunked_req.origin_input_ids)
+                - len(self.chunked_req.prefix_indices),
+            )
+        pending_tokens = min(pending_tokens, self.max_prefill_tokens)
+
+        oldest_waiting_age_ms = 0.0
+        if self.server_args.prefill_delayer_max_queue_ms is not None:
+            now = time.perf_counter()
+            for r in self.waiting_queue:
+                t = r.time_stats.wait_queue_entry_time
+                if t > 0:
+                    age_ms = (now - t) * 1000.0
+                    if age_ms > oldest_waiting_age_ms:
+                        oldest_waiting_age_ms = age_ms
+
+        return dict(
+            prefillable=prefillable,
+            pending_tokens=pending_tokens,
+            # decode-only: chunked_req (mid-prefill) is tracked separately and is
+            # not in running_batch, so running_batch.reqs is the decode load.
+            running_decode_batch=running_bs,
+            kv_usage=self.pool_stats_observer.get_pool_stats().get_max_pool_usage(),
+            has_partial=self.chunked_req is not None,
+            oldest_waiting_age_ms=oldest_waiting_age_ms,
+        )
+
     def _get_new_batch_prefill_raw(
         self,
-        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
@@ -2892,7 +2923,6 @@ class Scheduler(
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
             prefill_max_requests=self.server_args.prefill_max_requests,
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
         )

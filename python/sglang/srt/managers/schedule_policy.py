@@ -4,7 +4,6 @@ import logging
 from array import array
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -453,7 +452,6 @@ class PrefillAdder:
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
-        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
     ):
@@ -541,10 +539,7 @@ class PrefillAdder:
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
-        self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
-        # Snapshot of scheduler waiting_queue length at the start of this
-        # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
@@ -922,13 +917,6 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
-        if (self.prefill_delayer_single_pass is not None) and (
-            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True
-            )
-        ):
-            return AddReqResult.OTHER
-
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
@@ -976,16 +964,6 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
-        if (self.prefill_delayer_single_pass is not None) and (
-            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
-                max_prefill_bs=self.max_prefill_bs,
-                max_running_requests=self.max_running_requests,
-                waiting_queue_len=self.waiting_queue_len,
-            )
-        ):
-            return AddReqResult.OTHER
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.

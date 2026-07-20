@@ -2677,6 +2677,58 @@ class ServerArgs:
             "5000; defaults to 5000 if unset."
         ),
     ] = None
+    prefill_delayer_target_fill: A[
+        Optional[float],
+        (
+            "Opt-in to the token-based fill-target (coalescer) delay trigger. "
+            "Holds prefill admission until the SUM of pending prefill tokens "
+            "across all DP ranks reaches target_fill * (max_prefill_tokens * "
+            "num_dp_ranks), so quiet ranks keep accumulating instead of firing "
+            "tiny prefills (Nagle's algorithm for prefill). The single-hold "
+            "wall-clock cap (--prefill-delayer-max-delay-ms) still applies as a "
+            "stall give-up. Unset (default) disables it. Typical: 0.5 ~ 0.8."
+        ),
+    ] = None
+    prefill_delayer_max_queue_ms: A[
+        Optional[float],
+        (
+            "End-to-end TTFT SLA guard (ms) for the prefill coalescer. If any DP "
+            "rank has a schedulable waiting prefill whose true wait since entering "
+            "the waiting queue exceeds this threshold, the coalescer force-releases "
+            "on all ranks (cross-rank OR), regardless of the fill target. Unset "
+            "(default) disables it. Size it to your TTFT SLA."
+        ),
+    ] = None
+    prefill_delayer_ttft_max_ticks: A[
+        int,
+        (
+            "Coalescer single-hold TTFT bound (ticks). Force-release once a hold "
+            "episode has lasted this many scheduler ticks, regardless of fill."
+        ),
+    ] = 30
+    prefill_delayer_partial_max_ticks: A[
+        int,
+        (
+            "Coalescer tight bound (ticks) for holds while any rank is mid-chunked-"
+            "prefill (a partial holds KV, so release it sooner than ttft_max_ticks)."
+        ),
+    ] = 8
+    prefill_delayer_stall_ticks: A[
+        int,
+        (
+            "Coalescer adaptive give-up: force-release after the aggregate pending "
+            "token count has stopped growing for this many consecutive ticks "
+            "(waiting longer would not fill the forward any further)."
+        ),
+    ] = 3
+    prefill_delayer_kv_high_watermark: A[
+        float,
+        (
+            "Coalescer KV-high must-fire watermark. If any prefillable rank's KV "
+            "cache usage is at/above this fraction, release immediately (cannot "
+            "accumulate more)."
+        ),
+    ] = 0.9
 
     # -------------------------------------------------------------------------
     # Min free slots delay (prefill refill batching)

@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import DeepEPMode, is_tbo_enabled
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
@@ -39,6 +39,25 @@ class DispatchDtype(Enum):
 class CombineDtype(Enum):
     bf16 = "bfloat16"
     fp8_direct_cast = "float8_direct_cast"
+
+
+class _FlyDSLCommStreamPool:
+    """One shared comm stream per device/process-group.
+
+    Both TBO inner dispatchers must enqueue collectives in the same order on the
+    same stream, while the primary compute stream runs the other ubatch.
+    """
+
+    _streams = {}
+
+    @classmethod
+    def get(cls, group) -> torch.cuda.Stream:
+        key = (torch.cuda.current_device(), id(group))
+        stream = cls._streams.get(key)
+        if stream is None:
+            stream = torch.cuda.Stream(priority=0)
+            cls._streams[key] = stream
+        return stream
 
 
 @lru_cache(maxsize=4)
@@ -202,6 +221,12 @@ class FlyDSLEPDispatcher(BaseDispatcher):
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
+        self.async_finish = async_finish
+        self._comm_stream = (
+            _FlyDSLCommStreamPool.get(group)
+            if is_tbo_enabled() and async_finish
+            else None
+        )
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
@@ -323,17 +348,25 @@ class FlyDSLEPDispatcher(BaseDispatcher):
                     device=device,
                 )
 
+        # Keep all dispatch inputs ready before the comm stream consumes them.
+        topk_weights = topk_weights.to(torch.float32)
+        ready_event = None
+        if self._comm_stream is not None:
+            ready_event = torch.cuda.Event(blocking=False, interprocess=False)
+            ready_event.record(torch.cuda.current_stream())
+
         self._dispatch_intermediate_state = (
             hidden_states,
             topk_weights,
             topk_ids,
             scale,
             output_dtype,
+            ready_event,
         )
 
     def dispatch_b(self) -> DispatchOutput:
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        hidden_states, topk_weights, topk_ids, scale, output_dtype = (
+        hidden_states, topk_weights, topk_ids, scale, output_dtype, ready_event = (
             self._dispatch_intermediate_state
         )
         del self._dispatch_intermediate_state
@@ -341,13 +374,35 @@ class FlyDSLEPDispatcher(BaseDispatcher):
         op = self.flydsl_op
         recv_cap = self._resolve_dynamic_recv_cap(op.cfg.effective_max_recv)
         self._op_recv_cap = recv_cap
-        out_tok, out_wts, out_scales, out_idx, total_recv = op.dispatch(
-            hidden_states,
-            topk_weights.to(torch.float32),
-            scale,
-            topk_ids,
-            recv_cap=recv_cap,
-        )
+        if self._comm_stream is None:
+            out_tok, out_wts, out_scales, out_idx, total_recv = op.dispatch(
+                hidden_states,
+                topk_weights,
+                scale,
+                topk_ids,
+                recv_cap=recv_cap,
+            )
+        else:
+            compute_stream = torch.cuda.current_stream()
+            # Event + Python-ref lifetime: avoid record_stream(comm), whose
+            # deferred frees caused the historical DP-TBO allocator fragmentation.
+            keepalive = (hidden_states, topk_weights, topk_ids, scale)
+            with torch.cuda.stream(self._comm_stream):
+                assert ready_event is not None
+                self._comm_stream.wait_event(ready_event)
+                out_tok, out_wts, out_scales, out_idx, total_recv = op.dispatch(
+                    hidden_states,
+                    topk_weights,
+                    scale,
+                    topk_ids,
+                    recv_cap=recv_cap,
+                )
+                done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                done_event.record(self._comm_stream)
+            compute_stream.wait_event(done_event)
+            # The wait is now ordered before these compute-stream-owned tensors
+            # can be reclaimed.
+            del keepalive
         self._recv_topk_ids = out_idx
         return FlyDSLEPNormalDispatchOutput(
             hidden_states=out_tok,
@@ -366,19 +421,48 @@ class FlyDSLEPDispatcher(BaseDispatcher):
 
     def combine_a(self, combine_input: CombineInput):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        self._combine_intermediate_state = tuple(combine_input)
+        ready_event = None
+        if self._comm_stream is not None:
+            ready_event = torch.cuda.Event(blocking=False, interprocess=False)
+            ready_event.record(torch.cuda.current_stream())
+        self._combine_intermediate_state = (*tuple(combine_input), ready_event)
 
     def combine_b(self) -> torch.Tensor:
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        hidden_states, _topk_ids, _topk_weights = self._combine_intermediate_state
-        del self._combine_intermediate_state
-        out_tok, _ = self.flydsl_op.combine(
-            hidden_states,
-            None,
-            self._recv_topk_ids,
-            cur_tok=self._op_cur_tok,
-            recv_cap=self._op_recv_cap,
+        hidden_states, _topk_ids, _topk_weights, ready_event = (
+            self._combine_intermediate_state
         )
+        del self._combine_intermediate_state
+        if self._comm_stream is None:
+            out_tok, _ = self.flydsl_op.combine(
+                hidden_states,
+                None,
+                self._recv_topk_ids,
+                cur_tok=self._op_cur_tok,
+                recv_cap=self._op_recv_cap,
+            )
+        else:
+            compute_stream = torch.cuda.current_stream()
+            keepalive = (
+                hidden_states,
+                _topk_ids,
+                _topk_weights,
+                self._recv_topk_ids,
+            )
+            with torch.cuda.stream(self._comm_stream):
+                assert ready_event is not None
+                self._comm_stream.wait_event(ready_event)
+                out_tok, _ = self.flydsl_op.combine(
+                    hidden_states,
+                    None,
+                    self._recv_topk_ids,
+                    cur_tok=self._op_cur_tok,
+                    recv_cap=self._op_recv_cap,
+                )
+                done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                done_event.record(self._comm_stream)
+            compute_stream.wait_event(done_event)
+            del keepalive
         return out_tok
 
     def _resolve_dynamic_recv_cap(self, physical_cap: int) -> int:

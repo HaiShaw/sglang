@@ -113,9 +113,14 @@ def init_flydsl_op(
         if combine_dtype == CombineDtype.fp8_direct_cast
         else "none"
     )
+    tbo_block_num = (
+        get_int_env_var("SGLANG_FLYDSL_TBO_BLOCK_NUM", 0)
+        if is_tbo_enabled()
+        else 0
+    )
     logger.info(
         "[FlyDSL init] world=%d rank=%d hidden=%d max_tokens=%d "
-        "local_experts=%d topk=%d dispatch=%s combine=%s",
+        "local_experts=%d topk=%d dispatch=%s combine=%s tbo_block=%d",
         world_size,
         rank,
         hidden_size,
@@ -124,6 +129,7 @@ def init_flydsl_op(
         router_topk,
         dispatch_dtype,
         combine_dtype,
+        tbo_block_num,
     )
     return FlyDSLDispatchCombineIntraNodeOp(
         FlyDSLDispatchCombineConfig(
@@ -141,6 +147,10 @@ def init_flydsl_op(
             scale_type_size=scale_type_size,
             quant_type=quant_type,
             enable_std_moe=False,
+            dispatch_block_num=tbo_block_num or None,
+            dispatch_warp_num_per_block=4 if tbo_block_num else None,
+            combine_block_num=tbo_block_num or None,
+            combine_warp_num_per_block=4 if tbo_block_num else None,
             max_total_recv_tokens=get_int_env_var(
                 "SGLANG_FLYDSL_PREALLOC_MAX_RECV_TOKENS", 0
             ),

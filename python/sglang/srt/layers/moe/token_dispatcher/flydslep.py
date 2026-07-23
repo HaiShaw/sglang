@@ -54,9 +54,9 @@ def init_flydsl_op(
     dispatch_dtype=DispatchDtype.bf16,
     combine_dtype=CombineDtype.bf16,
 ):
-    """Initialize one aiter-owned FlyDSL dispatch/combine op per config."""
+    """Initialize one SGLang-vendored FlyDSL dispatch/combine op per config."""
     import mori.shmem as ms
-    from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
+    from sglang.kernels.third_party.flydsl_a2a import (
         FlyDSLDispatchCombineConfig,
         FlyDSLDispatchCombineIntraNodeOp,
     )

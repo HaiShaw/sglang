@@ -523,6 +523,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
     _original_num_tokens: Optional[int] = None
+    global_max_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -762,6 +763,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            global_max_num_tokens=batch.global_max_num_tokens,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,

@@ -197,6 +197,9 @@ def _update_gather_batch(
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
+    batch.global_max_num_tokens = max(
+        getattr(mlp_sync_info, "global_num_tokens", [mlp_sync_info.num_tokens])
+    )
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]

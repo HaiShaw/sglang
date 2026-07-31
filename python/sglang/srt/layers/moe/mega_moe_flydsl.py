@@ -104,6 +104,32 @@ def _mtpr() -> int:
     return mtpr
 
 
+def _decode_mtpr() -> int:
+    mtpr = int(envs.SGLANG_AMD_FLYDSL_MEGA_DECODE_MTPR.get())
+    if mtpr == 0:
+        return _mtpr()
+    if mtpr <= 0 or mtpr & (mtpr - 1):
+        raise ValueError(
+            f"SGLANG_AMD_FLYDSL_MEGA_DECODE_MTPR={mtpr} must be zero or a positive power of two"
+        )
+    return mtpr
+
+
+def _select_mtpr(forward_batch: ForwardBatch | None) -> int:
+    global_has_extend = bool(
+        forward_batch is not None and forward_batch.is_extend_in_batch
+    )
+    use_decode = not global_has_extend
+    return _decode_mtpr() if use_decode else _mtpr()
+
+
+def _max_workload_tokens(forward_batch: ForwardBatch | None, local_tokens: int) -> int:
+    if forward_batch is not None and forward_batch.global_max_num_tokens is not None:
+        return int(forward_batch.global_max_num_tokens)
+    global_tokens = get_dp_global_num_tokens()
+    return max(global_tokens) if global_tokens else local_tokens
+
+
 def _ep_rank_world():
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
@@ -351,12 +377,23 @@ def _run_mega_routed(
         topk_weights = hidden_states.new_zeros((1, topk), dtype=torch.float32)
 
     fd = _import_flydsl()
-    selected_mtpr = _mtpr()
+    selected_mtpr = _select_mtpr(forward_batch)
     assert x_in.shape[0] <= selected_mtpr, (
         f"FlyDSL MegaMoE local tokens {x_in.shape[0]} exceed selected "
         f"MTPR {selected_mtpr}"
     )
     quant = envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or "a8w4"
+    if fd.is_v2 and _decode_mtpr() != _mtpr():
+        for capacity in (_mtpr(), _decode_mtpr()):
+            _get_or_build_mega_moe(
+                moe.experts,
+                model_dim=hidden_size,
+                inter_dim=moe.config.moe_intermediate_size,
+                experts=experts,
+                topk=topk,
+                quant=quant,
+                mtpr=capacity,
+            )
     mega = _get_or_build_mega_moe(
         moe.experts,
         model_dim=hidden_size,
@@ -367,15 +404,14 @@ def _run_mega_routed(
         mtpr=selected_mtpr,
     )
     _swap_layer_weights(mega, moe.experts)
+    global_max_tokens = _max_workload_tokens(forward_batch, x_in.shape[0])
     if fd.is_v2 and fd.workload is not None:
-        global_tokens = get_dp_global_num_tokens()
-        max_tokens = max(global_tokens) if global_tokens else x_in.shape[0]
         forward_mode = (
             str(forward_batch.forward_mode) if forward_batch is not None else "eager"
         )
         graph_bucket = x_in.shape[0] if get_is_capture_mode() else None
         workload = fd.workload.from_max_tokens(
-            max_tokens,
+            global_max_tokens,
             selected_mtpr,
             forward_mode=forward_mode,
             graph_bucket=graph_bucket,

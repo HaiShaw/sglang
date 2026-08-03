@@ -258,9 +258,16 @@ def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
 
 
 def _is_flydsl_dispatch_output(dispatch_output: Any) -> bool:
+    """Whether dispatch exposes a fixed-cap FlyDSL-style token-major view.
+
+    MORI EPv2 uses the same no-fake-expert Aiter contract as standalone FlyDSL,
+    despite using cco-LSA rather than mori-shmem as its provider.
+    """
     cls = type(dispatch_output)
-    return cls.__name__.startswith("FlyDSL") or cls.__module__.endswith(
-        ".token_dispatcher.flydslep"
+    return (
+        cls.__name__.startswith("FlyDSL")
+        or cls.__module__.endswith(".token_dispatcher.flydslep")
+        or cls.__module__.endswith(".token_dispatcher.moriepv2")
     )
 
 

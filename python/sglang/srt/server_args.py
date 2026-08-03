@@ -273,6 +273,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
     "mori",
+    "mori-epv2",
     "flydsl",
     "ascend_fuseep",
     "flashinfer",
@@ -2196,6 +2197,7 @@ class ServerArgs:
             "mooncake",
             "nixl",
             "mori",
+            "mori-epv2",
             "flydsl",
             "ascend_fuseep",
             "flashinfer",
@@ -4106,8 +4108,10 @@ class ServerArgs:
             ),
             (
                 "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
+                lambda: (
+                    current_platform.is_out_of_tree()
+                    and not current_platform.support_piecewise_cuda_graph()
+                ),
             ),
             (
                 "MoE A2A backend",
@@ -4116,14 +4120,18 @@ class ServerArgs:
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+                ),
             ),
             (
                 "GGUF quantization",
-                lambda: self.load_format == "gguf"
-                or _resolved_view(self).quantization == "gguf"
-                or check_gguf_file(self.model_path),
+                lambda: (
+                    self.load_format == "gguf"
+                    or _resolved_view(self).quantization == "gguf"
+                    or check_gguf_file(self.model_path)
+                ),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
             (
@@ -4138,8 +4146,10 @@ class ServerArgs:
             ("symmetric memory", lambda: self.enable_symm_mem),
             (
                 "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
+                lambda: (
+                    self.enable_eplb
+                    or self.expert_distribution_recorder_mode is not None
+                ),
             ),
             (
                 "context parallel (attn_cp_size > 1)",
@@ -4198,8 +4208,10 @@ class ServerArgs:
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
+                ),
             ),
         ]
         for name, predicate in rules:
@@ -6376,6 +6388,34 @@ class ServerArgs:
                     "(chunked_prefill_size by default)"
                 )
 
+        if a2a_backend == "mori-epv2":
+            if self.deepep_mode == "auto":
+                self.deepep_mode = "normal"
+                logger.warning("auto set deepep_mode=`normal` for MORI EPv2")
+            if self.deepep_mode != "normal":
+                raise ValueError(
+                    "MORI EPv2 currently supports deepep_mode=`normal` only"
+                )
+            logger.warning(
+                "MORI EPv2 MoE A2A is enabled (cco-LSA, intranode, "
+                f"world_size<=8). Expert parallel size follows TP[{self.tp_size}]."
+            )
+            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+                current = int(
+                    os.environ.get(
+                        "SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "4096"
+                    )
+                )
+                if current < self.chunked_prefill_size:
+                    os.environ["SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = (
+                        str(self.chunked_prefill_size)
+                    )
+                    logger.warning(
+                        "auto set "
+                        "SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{self.chunked_prefill_size} (was {current})"
+                    )
+
         if a2a_backend == "flydsl":
             if self.deepep_mode == "auto":
                 self.deepep_mode = "normal"
@@ -7317,13 +7357,12 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        assert (
+            self.disaggregation_mode == "null"
+        ), "--enable-unified-memory is not yet compatible with PD disaggregation."
+        assert (
+            self.speculative_algorithm is None
+        ), "--enable-unified-memory is not yet compatible with speculative decoding."
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "

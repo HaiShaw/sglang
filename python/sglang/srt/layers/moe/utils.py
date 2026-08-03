@@ -26,12 +26,12 @@ logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
-
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
+    MORI_EPV2 = "mori-epv2"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
@@ -72,6 +72,12 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_mori_epv2(self):
+        return self == MoeA2ABackend.MORI_EPV2
+
+    def is_mori_family(self):
+        return self.is_mori() or self.is_mori_epv2()
+
     def is_flydsl(self):
         return self == MoeA2ABackend.FLYDSL
 
@@ -88,12 +94,12 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
+            MoeA2ABackend.MORI_EPV2,
             MoeA2ABackend.FLYDSL,
         )
 
 
 class MoeRunnerBackend(Enum):
-
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
@@ -172,7 +178,6 @@ class MoeRunnerBackend(Enum):
 
 
 class DeepEPMode(Enum):
-
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
     AUTO = "auto"
@@ -385,7 +390,7 @@ def is_sbo_enabled() -> bool:
 def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_flydsl()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori_family() or b.is_flydsl()
 
 
 def uses_per_rank_fused_shared_slots() -> bool:

@@ -3502,9 +3502,13 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif get_moe_a2a_backend().is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer() or get_moe_a2a_backend().is_flydsl():
-            # FlashInfer/FlyDSL MoE A2A need a rank-invariant, DP-synchronized per-rank
-            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
+        elif (
+            get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_flydsl()
+            or get_moe_a2a_backend().is_mori_epv2()
+        ):
+            # FlashInfer/FlyDSL/MORI EPv2 A2A need a rank-invariant,
+            # DP-synchronized per-rank token count: their fixed-geometry decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
             # replay different-sized graphs -> geometry mismatch -> illegal memory
             # access (issue #30242). No literal MLP TP-gather happens here -- the

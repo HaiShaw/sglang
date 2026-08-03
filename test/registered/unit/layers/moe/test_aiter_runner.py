@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterQuantType,
     AiterRunnerCore,
     AiterRunnerInput,
+    _is_flydsl_dispatch_output,
     _resolve_mori_dispatch_slice_limit,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -135,6 +136,20 @@ def test_mori_input_slicing_never_applies_to_flydsl(
             configured_max=configured_max,
         )
         == expected
+    )
+
+
+def test_mori_epv2_uses_fixed_cap_no_slice_contract():
+    output_type = type("MoriEPv2NormalDispatchOutput", (), {})
+    output_type.__module__ = "sglang.srt.layers.moe.token_dispatcher.moriepv2"
+    assert _is_flydsl_dispatch_output(output_type())
+    assert (
+        _resolve_mori_dispatch_slice_limit(
+            is_mori=True,
+            is_flydsl=True,
+            configured_max=64,
+        )
+        is None
     )
 
 

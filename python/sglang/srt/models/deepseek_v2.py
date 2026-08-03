@@ -709,6 +709,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_mori_epv2()
                 or get_moe_a2a_backend().is_flydsl()
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
@@ -792,6 +793,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_mori_epv2()
             or get_moe_a2a_backend().is_flydsl()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -814,6 +816,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_mori_epv2()
             or get_moe_a2a_backend().is_flydsl()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
@@ -1528,7 +1531,7 @@ class DeepseekV2MoE(nn.Module):
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
-        if get_moe_a2a_backend().is_mori() or get_moe_a2a_backend().is_flydsl():
+        if get_moe_a2a_backend().is_mori_family() or get_moe_a2a_backend().is_flydsl():
             num_tokens = state.pop("num_tokens")
             final_hidden_states = final_hidden_states[:num_tokens]
 
@@ -2307,7 +2310,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
-        if get_moe_a2a_backend().is_mori() or get_moe_a2a_backend().is_flydsl():
+        if get_moe_a2a_backend().is_mori_family() or get_moe_a2a_backend().is_flydsl():
             state.num_tokens = hidden_states.shape[0]
         state.update(
             dict(

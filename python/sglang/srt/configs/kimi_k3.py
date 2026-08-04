@@ -122,3 +122,15 @@ class KimiK3Config(PretrainedConfig):
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+    @property
+    def mamba_chunk_size(self) -> int:
+        # Floor at 128 (== 2 * FLA_CHUNK_SIZE): mamba_cache_chunk_size =
+        # max(mamba_chunk_size, page_size), so with a small page_size (e.g. 64) the
+        # mamba cache chunk would otherwise collapse to FLA_CHUNK_SIZE (64). At that
+        # granularity the radix tree reuses another request's KDA recurrent state at
+        # tiny shared prefixes, whose different kernel-rounding perturbs decode logits
+        # (gsm8k ~37% at page_size 64). A floor of 128 keeps >=2 kernel chunks per
+        # cache chunk and restores correctness while leaving page_size free (cf. the
+        # analogous floor on InklingConfig.mamba_chunk_size).
+        return 128

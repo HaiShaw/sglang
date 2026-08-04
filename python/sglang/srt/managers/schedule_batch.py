@@ -2504,18 +2504,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 * mamba_cache_chunk_size
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+            # If the aligned checkpoint position is NOT the last position of this extend
+            # (mamba_track_seqlen is still the full prefix+extend length set above), the
+            # final recurrent state in ssm_states is PAST the checkpoint, so the snapshot
+            # must instead come from the per-chunk `h` states at the aligned position.
+            # _force_track_h() nudges the seqlen off the chunk boundary so that
+            # _init_track_ssm_indices routes it through h (rather than ssm_states). The
+            # radix key length stays mamba_track_seqlen_aligned, so snapshot == key.
+            if mamba_track_seqlen_aligned != mamba_track_seqlen:
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
             # In lazy mode, skip the swap — the second ping-pong slot is not

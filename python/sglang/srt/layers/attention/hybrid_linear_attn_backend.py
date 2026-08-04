@@ -286,10 +286,21 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
+        # `h` (per-chunk recurrent states returned by the linear-attn kernel) is packed
+        # at the KERNEL chunk stride — FLA_CHUNK_SIZE for KDA/GDN, mamba_chunk_size for
+        # Mamba2 — NOT mamba_cache_chunk_size (= max(kernel_chunk, page_size)). When
+        # page_size > kernel_chunk the two diverge, so `h` must be sized/indexed by the
+        # kernel stride or the snapshot reads the wrong chunk row.
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            kernel_chunk = self.mamba_chunk_size
+            num_h_states = extend_seq_lens // kernel_chunk
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+                CHUNK_SIZE as FLA_CHUNK_SIZE,
+            )
+
+            kernel_chunk = FLA_CHUNK_SIZE
+            num_h_states = (extend_seq_lens - 1) // kernel_chunk + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -299,17 +310,18 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
+        # Aligned to the cache chunk (only true for the last position of the extend,
+        # since _force_track_h nudges every earlier checkpoint off the boundary):
+        # take the final recurrent state from ssm_states.
         is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
-
-        # Aligned: last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
-        # Unaligned: intermediate state from h.
-        # TODO: handle mamba_cache_chunk_size % page size != 0
+        # Otherwise take the intermediate state from `h`, indexed at the kernel chunk
+        # stride (h[m] == state after m*kernel_chunk tokens).
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
+            lens_masked[not_aligned] // kernel_chunk
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 

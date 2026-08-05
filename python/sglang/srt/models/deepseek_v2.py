@@ -1492,10 +1492,16 @@ class DeepseekV2MoE(nn.Module):
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
-            if get_moe_a2a_backend().is_flydsl():
+            backend = get_moe_a2a_backend()
+            if backend.is_flydsl() or backend.is_mori_epv2():
+                child_attr = (
+                    "flydsl_tbo_cluster_dispatch_rows"
+                    if backend.is_flydsl()
+                    else "mori_epv2_tbo_cluster_dispatch_rows"
+                )
                 dispatch_kwargs["dynamic_recv_cluster_rows"] = getattr(
                     state.forward_batch,
-                    "flydsl_tbo_cluster_dispatch_rows",
+                    child_attr,
                     None,
                 )
             self.experts.dispatcher.dispatch_a(**dispatch_kwargs)

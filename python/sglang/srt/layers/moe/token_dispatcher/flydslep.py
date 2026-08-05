@@ -218,11 +218,15 @@ def _validate_all_rank_recv_cap(
         )
 
 
-def _configured_physical_recv_cap(world_size: int) -> int:
+def _configured_physical_recv_cap(
+    world_size: int, env_prefix: str = "SGLANG_FLYDSL"
+) -> int:
     max_per_rank = get_int_env_var(
-        "SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+        f"{env_prefix}_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
     )
-    configured_total = get_int_env_var("SGLANG_FLYDSL_PREALLOC_MAX_RECV_TOKENS", 0)
+    configured_total = get_int_env_var(
+        f"{env_prefix}_PREALLOC_MAX_RECV_TOKENS", 0
+    )
     if configured_total <= 0:
         effective_per_rank = max_per_rank
     else:
@@ -237,6 +241,8 @@ def prepare_tbo_eager_recv_cap_metadata(
     parent_global_num_tokens: Optional[Sequence[int]],
     children: Sequence,
     group,
+    env_prefix: str = "SGLANG_FLYDSL",
+    child_attr: str = "flydsl_tbo_cluster_dispatch_rows",
 ) -> bool:
     """Populate two TBO children once per eager forward.
 
@@ -244,7 +250,7 @@ def prepare_tbo_eager_recv_cap_metadata(
     is unavailable. Exact per-rank child padding needs one small host all-gather;
     the optional validator uses one additional diagnostic-only all-gather.
     """
-    if not get_bool_env_var("SGLANG_FLYDSL_DYNAMIC_RECV_CAP_EAGER", "true"):
+    if not get_bool_env_var(f"{env_prefix}_DYNAMIC_RECV_CAP_EAGER", "true"):
         return False
     world_size = int(group.world_size)
     if (
@@ -269,10 +275,10 @@ def prepare_tbo_eager_recv_cap_metadata(
         return False
 
     for child, rows in zip(children, cluster_rows, strict=True):
-        child.flydsl_tbo_cluster_dispatch_rows = rows
+        setattr(child, child_attr, rows)
 
-    if get_bool_env_var("SGLANG_FLYDSL_DYNAMIC_RECV_CAP_VALIDATE", "false"):
-        physical_cap = _configured_physical_recv_cap(world_size)
+    if get_bool_env_var(f"{env_prefix}_DYNAMIC_RECV_CAP_VALIDATE", "false"):
+        physical_cap = _configured_physical_recv_cap(world_size, env_prefix)
         local_candidates = tuple(
             _resolve_eager_recv_cap(rows, physical_cap) for rows in cluster_rows
         )

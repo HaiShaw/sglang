@@ -11,6 +11,22 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 
 
+def _expert_output(dispatched, fp4_enabled: bool, fp4_lookup=None):
+    if not fp4_enabled:
+        return dispatched.hidden_states
+
+    packed = dispatched.hidden_states.view(torch.uint8)
+    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
+    values = fp4_lookup[nibbles.long()]
+    scales = dispatched.hidden_states_scale.repeat_interleave(32, dim=1).float()
+    output = (values * scales[:, : values.shape[1]]).to(torch.bfloat16)
+    valid_rows = (
+        torch.arange(output.shape[0], device=output.device)
+        < dispatched.num_recv_tokens_per_expert.reshape(-1)[0]
+    )
+    return torch.where(valid_rows[:, None], output, torch.zeros_like(output))
+
+
 class _Group:
     def __init__(self, process_group):
         self.cpu_group = process_group
@@ -46,6 +62,33 @@ def main():
     experts_per_rank = int(os.environ.get("EPR", "48"))
     num_experts = world_size * experts_per_rank
     tokens = int(os.environ.get("TOKENS", "64"))
+    fp4_enabled = os.environ.get("FP4", "0") == "1"
+    fp4_lookup = (
+        torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        if fp4_enabled
+        else None
+    )
     if os.environ.get("EMPTY_LAST_RANK", "0") == "1" and rank == world_size - 1:
         tokens = 0
 
@@ -53,6 +96,7 @@ def main():
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
+        world_rank=rank,
     )
     group = _Group(dist.group.WORLD)
     dispatcher = adapter.MoriEPv2Dispatcher(
@@ -63,6 +107,13 @@ def main():
         hidden_size=hidden_size,
         params_dtype=torch.bfloat16,
         deepep_mode=DeepEPMode.NORMAL,
+    )
+    dispatcher.set_quant_config(
+        {
+            "weight_dtype": (
+                torch.float4_e2m1fn_x2 if fp4_enabled else torch.bfloat16
+            )
+        }
     )
 
     generator = torch.Generator(device="cpu").manual_seed(20260803 + rank)
@@ -86,7 +137,11 @@ def main():
 
     dispatched = dispatcher.dispatch(hidden, topk_output)
     combined = dispatcher.combine(
-        (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
+        (
+            _expert_output(dispatched, fp4_enabled, fp4_lookup),
+            dispatched.topk_ids,
+            dispatched.topk_weights,
+        )
     )
     torch.cuda.synchronize()
     dispatcher.op.comm.barrier()
@@ -94,7 +149,11 @@ def main():
     expected = (
         _expected_unique_destinations(topk_ids, experts_per_rank) * hidden.float().cpu()
     ).to(torch.bfloat16)
-    ok = torch.allclose(combined.float().cpu(), expected.float(), atol=2e-2, rtol=2e-2)
+    tolerance = 6e-1 if fp4_enabled else 2e-2
+    error = (combined.float().cpu() - expected.float()).abs()
+    ok = torch.allclose(
+        combined.float().cpu(), expected.float(), atol=tolerance, rtol=tolerance
+    )
     failures = torch.tensor([not ok], dtype=torch.int32)
     dist.all_reduce(failures)
     if rank == 0:
@@ -104,6 +163,9 @@ def main():
             f"tokens={tokens} hidden={hidden_size} topk={topk} "
             f"skewed={os.environ.get('SKEWED', '0')} "
             f"empty_last_rank={os.environ.get('EMPTY_LAST_RANK', '0')}",
+            f"fp4={fp4_enabled}",
+            f"mean_abs_error={error.mean().item():.6f}",
+            f"max_abs_error={error.max().item() if error.numel() else 0:.6f}",
             flush=True,
         )
 
@@ -114,7 +176,7 @@ def main():
             graph_dispatched = dispatcher.dispatch(hidden, topk_output)
             graph_combined = dispatcher.combine(
                 (
-                    graph_dispatched.hidden_states,
+                    _expert_output(graph_dispatched, fp4_enabled, fp4_lookup),
                     graph_dispatched.topk_ids,
                     graph_dispatched.topk_weights,
                 )
@@ -128,8 +190,8 @@ def main():
         graph_ok = torch.allclose(
             graph_combined.float().cpu(),
             expected.float(),
-            atol=2e-2,
-            rtol=2e-2,
+            atol=tolerance,
+            rtol=tolerance,
         )
         graph_failures = torch.tensor([not graph_ok], dtype=torch.int32)
         dist.all_reduce(graph_failures)
@@ -137,7 +199,7 @@ def main():
         eager_dispatched = dispatcher.dispatch(hidden, topk_output)
         eager_after_graph = dispatcher.combine(
             (
-                eager_dispatched.hidden_states,
+                _expert_output(eager_dispatched, fp4_enabled, fp4_lookup),
                 eager_dispatched.topk_ids,
                 eager_dispatched.topk_weights,
             )
@@ -147,8 +209,8 @@ def main():
         eager_after_graph_ok = torch.allclose(
             eager_after_graph.float().cpu(),
             expected.float(),
-            atol=2e-2,
-            rtol=2e-2,
+            atol=tolerance,
+            rtol=tolerance,
         )
         eager_after_graph_failures = torch.tensor(
             [not eager_after_graph_ok], dtype=torch.int32

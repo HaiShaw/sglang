@@ -6,7 +6,7 @@ import logging
 import os
 from enum import Enum, auto
 from functools import lru_cache
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -19,10 +19,76 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode, is_tbo_enabled
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 logger = logging.getLogger(__name__)
 _logged_graph_caps = set()
+MXFP4_BLOCK_SIZE = 32
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+
+class _MoriEPv2TBOGeometry(NamedTuple):
+    dispatch_block_num: Optional[int]
+    dispatch_warp_num_per_block: Optional[int]
+    combine_block_num: Optional[int]
+    combine_warp_num_per_block: Optional[int]
+
+
+def _resolve_tbo_geometry(
+    *,
+    tbo_enabled: bool,
+    dispatch_block_num: int,
+    combine_block_num: int,
+    dispatch_warp_num_per_block: int,
+    combine_warp_num_per_block: int,
+) -> _MoriEPv2TBOGeometry:
+    if not tbo_enabled:
+        return _MoriEPv2TBOGeometry(None, None, None, None)
+    values = {
+        "SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM": dispatch_block_num,
+        "SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM": combine_block_num,
+        "SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK": (
+            dispatch_warp_num_per_block
+        ),
+        "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK": (
+            combine_warp_num_per_block
+        ),
+    }
+    for env_name, value in values.items():
+        if value <= 0:
+            raise ValueError(f"{env_name} must be positive; got {value}")
+    return _MoriEPv2TBOGeometry(
+        dispatch_block_num,
+        dispatch_warp_num_per_block,
+        combine_block_num,
+        combine_warp_num_per_block,
+    )
+
+
+class _MoriEPv2CommStreamPool:
+    _streams = {}
+
+    @classmethod
+    def get(cls, group, priority: int = 0) -> torch.cuda.Stream:
+        key = (torch.cuda.current_device(), id(group), priority)
+        stream = cls._streams.get(key)
+        if stream is None:
+            stream = torch.cuda.Stream(priority=priority)
+            cls._streams[key] = stream
+            logger.info(
+                "[MORI EPv2 TBO] configured shared comm stream priority=%d",
+                priority,
+            )
+        return stream
+
+
+def _get_tbo_comm_stream(group, *, tbo_enabled: bool, async_finish: bool):
+    if not (tbo_enabled and async_finish):
+        return None
+    if not get_bool_env_var("SGLANG_MORI_EPV2_TBO_USE_COMM_STREAM", "true"):
+        return None
+    priority = get_int_env_var("SGLANG_MORI_EPV2_TBO_COMM_STREAM_PRIORITY", 0)
+    return _MoriEPv2CommStreamPool.get(group, priority)
 
 
 class MoriEPv2NormalDispatchOutput(NamedTuple):
@@ -88,6 +154,10 @@ def init_mori_epv2_op(
     max_tokens_per_rank: int,
     instance_id: int = 0,
     max_total_recv_tokens: int = 0,
+    dispatch_dtype: torch.dtype = torch.bfloat16,
+    geometry: _MoriEPv2TBOGeometry = _MoriEPv2TBOGeometry(
+        None, None, None, None
+    ),
 ):
     from mori.ops.dispatch_combine_v2 import (
         EpDispatchCombineConfig,
@@ -96,9 +166,11 @@ def init_mori_epv2_op(
 
     if params_dtype != torch.bfloat16:
         raise ValueError(
-            "The first MORI EPv2 serving baseline requires BF16 dispatch/combine; "
+            "MORI EPv2 requires BF16 expert/combine output; "
             f"got params_dtype={params_dtype}"
         )
+    if dispatch_dtype not in (torch.bfloat16, torch.float4_e2m1fn_x2):
+        raise ValueError(f"unsupported MORI EPv2 dispatch dtype: {dispatch_dtype}")
 
     parallel = get_parallel()
     world_size = parallel.moe_ep_size
@@ -112,14 +184,30 @@ def init_mori_epv2_op(
         num_experts_per_rank=num_local_experts,
         num_experts_per_token=router_topk,
         data_type=torch.bfloat16,
+        dispatch_data_type=(
+            dispatch_dtype if dispatch_dtype != torch.bfloat16 else None
+        ),
+        combine_data_type=(
+            torch.bfloat16 if dispatch_dtype != torch.bfloat16 else None
+        ),
+        scale_dim=(
+            hidden_size // MXFP4_BLOCK_SIZE
+            if dispatch_dtype != torch.bfloat16
+            else 0
+        ),
+        scale_type_size=1 if dispatch_dtype != torch.bfloat16 else 0,
         combine_mode="gather",
         max_total_recv_tokens=max_total_recv_tokens,
+        dispatch_block_num=geometry.dispatch_block_num,
+        combine_block_num=geometry.combine_block_num,
+        warp_num_per_block=geometry.dispatch_warp_num_per_block,
+        combine_warp_num_per_block=geometry.combine_warp_num_per_block,
     )
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
     logger.info(
         "[MORI EPv2 init] world=%d rank=%d hidden=%d experts=%d local_experts=%d "
-        "topk=%d max_tokens=%d recv_cap=%d schedule=%s",
+        "topk=%d max_tokens=%d recv_cap=%d dispatch_dtype=%s geometry=%s schedule=%s",
         world_size,
         rank,
         hidden_size,
@@ -128,6 +216,8 @@ def init_mori_epv2_op(
         router_topk,
         max_tokens_per_rank,
         cfg.effective_max_recv,
+        dispatch_dtype,
+        geometry,
         cfg.schedule,
     )
     return op
@@ -141,7 +231,7 @@ class _Stage(Enum):
 
 
 class MoriEPv2Dispatcher(BaseDispatcher):
-    """Synchronous non-TBO MORI EPv2 dispatcher."""
+    """MORI EPv2 dispatcher, including two-child TBO orchestration."""
 
     def __init__(
         self,
@@ -158,11 +248,7 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         instance_id: int = 0,
     ):
         super().__init__()
-        del permute_fusion, async_finish, return_recv_hook
-        if is_tbo_enabled():
-            raise NotImplementedError(
-                "MORI EPv2 TBO is gated on non-TBO correctness and serving results"
-            )
+        del permute_fusion, return_recv_hook
         if not deepep_mode.enable_normal() or deepep_mode.enable_low_latency():
             raise ValueError("MORI EPv2 currently supports normal mode only")
         try:
@@ -182,11 +268,36 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.instance_id = instance_id
+        self.async_finish = async_finish
+        self.dispatch_dtype = torch.bfloat16
+        self._comm_stream = _get_tbo_comm_stream(
+            group, tbo_enabled=is_tbo_enabled(), async_finish=async_finish
+        )
+        self._geometry = _resolve_tbo_geometry(
+            tbo_enabled=is_tbo_enabled(),
+            dispatch_block_num=get_int_env_var(
+                "SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM", 32
+            ),
+            combine_block_num=get_int_env_var(
+                "SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM", 48
+            ),
+            dispatch_warp_num_per_block=get_int_env_var(
+                "SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK", 4
+            ),
+            combine_warp_num_per_block=get_int_env_var(
+                "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK", 4
+            ),
+        )
         self.max_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
         self._op = None
         self._stage = _Stage.INITIAL
+        self.fp4_quant_func = None
+        if _use_aiter:
+            from aiter import QuantType, get_hip_quant
+
+            self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
 
         parallel = get_parallel()
         self.expert_mask_gpu = torch.zeros(
@@ -196,9 +307,10 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         )
         start = parallel.moe_ep_rank * num_local_experts
         self.expert_mask_gpu[start : start + num_local_experts] = 1
-        # CCO communicator/window creation is collective and allocates symmetric
-        # VMM resources; it must finish during model construction, before SGLang
-        # enters CUDA graph capture for its first decode forward.
+
+    def _initialize_op(self):
+        # set_quant_config runs during model loading, before CUDA graph capture,
+        # so collective CCO window creation and graph-tier JIT happen safely.
         self._op = init_mori_epv2_op(
             self.group,
             self.router_topk,
@@ -209,10 +321,9 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             self.max_tokens_per_rank,
             self.instance_id,
             get_int_env_var("SGLANG_MORI_EPV2_PREALLOC_MAX_RECV_TOKENS", 0),
+            self.dispatch_dtype,
+            self._geometry,
         )
-        # Decode graph tiers need rank-consistent logical receive caps. Compile
-        # their kernels before capture while reusing this op's one full physical
-        # CCO arena; CCO does not support multiple simultaneous arena windows.
         graph_cap_max = get_int_env_var("SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX", 8192)
         graph_cap = 32
         while graph_cap <= min(graph_cap_max, self._op.cfg.effective_max_recv):
@@ -222,19 +333,20 @@ class MoriEPv2Dispatcher(BaseDispatcher):
     @property
     def op(self):
         if self._op is None:
-            self._op = init_mori_epv2_op(
-                self.group,
-                self.router_topk,
-                self.num_experts,
-                self.num_local_experts,
-                self.hidden_size,
-                self.params_dtype,
-                self.max_tokens_per_rank,
-                self.instance_id,
-            )
+            self._initialize_op()
         return self._op
 
-    def _select_recv_cap(self):
+    def _select_recv_cap(self, eager_cluster_rows: Optional[int] = None):
+        if eager_cluster_rows is not None:
+            from sglang.srt.layers.moe.token_dispatcher.flydslep import (
+                _resolve_eager_recv_cap,
+            )
+
+            eager_cap = _resolve_eager_recv_cap(
+                int(eager_cluster_rows), self.op.cfg.effective_max_recv
+            )
+            if eager_cap is not None:
+                return eager_cap
         try:
             from sglang.srt.model_executor.runner import get_is_capture_mode
         except ImportError:
@@ -268,40 +380,126 @@ class MoriEPv2Dispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict) -> None:
         super().set_quant_config(quant_config)
-        # Keep the first matched baseline at BF16 transport. Aiter still applies
-        # the model's A8W4 expert GEMM quantization after dispatch.
+        weight_dtype = quant_config.get("weight_dtype")
+        self.dispatch_dtype = (
+            torch.float4_e2m1fn_x2
+            if weight_dtype == torch.float4_e2m1fn_x2
+            else torch.bfloat16
+        )
+        override = os.environ.get("SGLANG_MORI_EPV2_DISPATCH_DTYPE", "").lower()
+        if override:
+            if override not in ("bf16", "fp4"):
+                raise ValueError(
+                    "SGLANG_MORI_EPV2_DISPATCH_DTYPE must be bf16 or fp4; "
+                    f"got {override!r}"
+                )
+            self.dispatch_dtype = (
+                torch.float4_e2m1fn_x2 if override == "fp4" else torch.bfloat16
+            )
+        if (
+            self.dispatch_dtype == torch.float4_e2m1fn_x2
+            and self.fp4_quant_func is None
+        ):
+            raise RuntimeError(
+                "MORI EPv2 FP4 dispatch requires Aiter per_1x32 quantization"
+            )
+        if self._op is None:
+            self._initialize_op()
 
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        dynamic_recv_cluster_rows: Optional[int] = None,
     ) -> DispatchOutput:
-        self.dispatch_a(hidden_states, topk_output)
+        self.dispatch_a(
+            hidden_states,
+            topk_output,
+            dynamic_recv_cluster_rows=dynamic_recv_cluster_rows,
+        )
         return self.dispatch_b()
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        dynamic_recv_cluster_rows: Optional[int] = None,
     ) -> None:
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         if hidden_states.dtype != torch.bfloat16:
             raise ValueError(
-                "MORI EPv2 BF16 baseline received "
+                "MORI EPv2 expects BF16 activations before transport quantization; "
                 f"hidden_states.dtype={hidden_states.dtype}"
             )
         self._num_tokens = hidden_states.shape[0]
+        self._dynamic_recv_cluster_rows = dynamic_recv_cluster_rows
+        output_dtype = hidden_states.dtype
+        scale = None
+        if self.dispatch_dtype == torch.float4_e2m1fn_x2:
+            if self._num_tokens:
+                hidden_states, scale = self.fp4_quant_func(
+                    hidden_states, shuffle=False
+                )
+            else:
+                hidden_states = torch.empty(
+                    (0, self.hidden_size // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=hidden_states.device,
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        ready_event = None
+        if self._comm_stream is not None:
+            ready_event = torch.cuda.Event(blocking=False, interprocess=False)
+            ready_event.record(torch.cuda.current_stream())
         self._dispatch_intermediate_state = (
             hidden_states,
             topk_output.topk_weights.to(torch.float32),
             topk_output.topk_ids.to(torch.int32),
+            scale,
+            output_dtype,
+            ready_event,
         )
 
     def dispatch_b(self) -> DispatchOutput:
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        hidden_states, topk_weights, topk_ids = self._dispatch_intermediate_state
+        hidden_states, topk_weights, topk_ids, scale, output_dtype, ready_event = (
+            self._dispatch_intermediate_state
+        )
         del self._dispatch_intermediate_state
-        recv_cap = self._select_recv_cap()
+        recv_cap = self._select_recv_cap(self._dynamic_recv_cluster_rows)
+        if self._comm_stream is None:
+            result = self.op.dispatch(
+                hidden_states,
+                topk_weights,
+                scale,
+                topk_ids,
+                return_routing=True,
+                recv_cap=recv_cap,
+                clone_routing=False,
+            )
+        else:
+            compute_stream = torch.cuda.current_stream()
+            keepalive = (hidden_states, topk_weights, topk_ids, scale)
+            with torch.cuda.stream(self._comm_stream):
+                assert ready_event is not None
+                self._comm_stream.wait_event(ready_event)
+                result = self.op.dispatch(
+                    hidden_states,
+                    topk_weights,
+                    scale,
+                    topk_ids,
+                    return_routing=True,
+                    recv_cap=recv_cap,
+                    clone_routing=False,
+                )
+                done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                done_event.record(self._comm_stream)
+            compute_stream.wait_event(done_event)
+            del keepalive
         (
             recv_hidden,
             recv_weights,
@@ -309,17 +507,14 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             recv_indices,
             total_recv,
             routing,
-        ) = self.op.dispatch(
-            hidden_states,
-            topk_weights,
-            None,
-            topk_ids,
-            return_routing=True,
-            recv_cap=recv_cap,
-            clone_routing=False,
-        )
+        ) = result
+        if recv_scales is not None and self.dispatch_dtype == torch.float4_e2m1fn_x2:
+            recv_scales = recv_scales.view(torch.float8_e8m0fnu)[
+                :, : self.hidden_size // MXFP4_BLOCK_SIZE
+            ]
         self._routing = routing
         self._recv_topk_ids = recv_indices
+        self._recv_cap = recv_cap
         return MoriEPv2NormalDispatchOutput(
             hidden_states=recv_hidden,
             hidden_states_scale=recv_scales,
@@ -328,7 +523,7 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             num_recv_tokens_per_expert=total_recv,
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
-            out_dtype=hidden_states.dtype,
+            out_dtype=output_dtype,
         )
 
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
@@ -337,18 +532,47 @@ class MoriEPv2Dispatcher(BaseDispatcher):
 
     def combine_a(self, combine_input: CombineInput) -> None:
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        self._combine_intermediate_state = tuple(combine_input)
+        ready_event = None
+        if self._comm_stream is not None:
+            ready_event = torch.cuda.Event(blocking=False, interprocess=False)
+            ready_event.record(torch.cuda.current_stream())
+        self._combine_intermediate_state = (*tuple(combine_input), ready_event)
 
     def combine_b(self) -> torch.Tensor:
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        hidden_states, _topk_ids, _topk_weights = self._combine_intermediate_state
-        del self._combine_intermediate_state
-        out, _ = self.op.combine(
-            hidden_states,
-            None,
-            self._recv_topk_ids,
-            routing=self._routing,
+        hidden_states, _topk_ids, _topk_weights, ready_event = (
+            self._combine_intermediate_state
         )
+        del self._combine_intermediate_state
+        if self._comm_stream is None:
+            out, _ = self.op.combine(
+                hidden_states,
+                None,
+                self._recv_topk_ids,
+                routing=self._routing,
+            )
+        else:
+            compute_stream = torch.cuda.current_stream()
+            keepalive = (
+                hidden_states,
+                _topk_ids,
+                _topk_weights,
+                self._recv_topk_ids,
+                self._routing,
+            )
+            with torch.cuda.stream(self._comm_stream):
+                assert ready_event is not None
+                self._comm_stream.wait_event(ready_event)
+                out, _ = self.op.combine(
+                    hidden_states,
+                    None,
+                    self._recv_topk_ids,
+                    routing=self._routing,
+                )
+                done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                done_event.record(self._comm_stream)
+            compute_stream.wait_event(done_event)
+            del keepalive
         if not torch.cuda.is_current_stream_capturing():
             del self._routing
         return out

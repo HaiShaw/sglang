@@ -2180,7 +2180,8 @@ class DeepseekV4Model(nn.Module):
         # per child for every MoE layer. Child split/padding is rank-local, so
         # collect both children's padded row counts once on the host TP group.
         # CUDA-graph/decode behavior remains on the existing cap path.
-        if get_moe_a2a_backend().is_flydsl() and not get_is_capture_mode():
+        backend = get_moe_a2a_backend()
+        if (backend.is_flydsl() or backend.is_mori_epv2()) and not get_is_capture_mode():
             from sglang.srt.layers.moe.token_dispatcher.flydslep import (
                 prepare_tbo_eager_recv_cap_metadata,
             )
@@ -2189,6 +2190,16 @@ class DeepseekV4Model(nn.Module):
                 parent_global_num_tokens=forward_batch.global_num_tokens_cpu,
                 children=forward_batch.tbo_children,
                 group=get_tp_group(),
+                env_prefix=(
+                    "SGLANG_FLYDSL"
+                    if backend.is_flydsl()
+                    else "SGLANG_MORI_EPV2"
+                ),
+                child_attr=(
+                    "flydsl_tbo_cluster_dispatch_rows"
+                    if backend.is_flydsl()
+                    else "mori_epv2_tbo_cluster_dispatch_rows"
+                ),
             )
 
         # Split the per-rank batch into the 2 ubatches (token-range slice + pad

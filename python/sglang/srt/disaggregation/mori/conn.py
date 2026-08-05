@@ -295,6 +295,53 @@ class BatchTransferPlan:
         return not self.sizes
 
 
+def _validate_batch_write_bounds(
+    *,
+    src_descs: List[MemoryDesc],
+    local_offsets: List[List[int]],
+    dst_descs: List[MemoryDesc],
+    remote_offsets: List[List[int]],
+    sizes: List[List[int]],
+    label: str,
+) -> None:
+    """Bounds-check a batch_write argument set against its registered regions.
+
+    mori's batch_write trusts its offsets: an entry running past the end of a
+    registered MemoryDesc is handed straight to the transfer engine and faults
+    there, surfacing as a bare `Fatal Python error: Segmentation fault` with no
+    Python-level context. Checking first turns that into a readable error naming
+    the offending entry. Gated by SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.
+    """
+    for i, (src_desc, dst_desc) in enumerate(zip(src_descs, dst_descs)):
+        offs_local = np.asarray(local_offsets[i], dtype=np.int64)
+        offs_remote = np.asarray(remote_offsets[i], dtype=np.int64)
+        lens = np.asarray(sizes[i], dtype=np.int64)
+        if lens.size == 0:
+            continue
+        src_cap, dst_cap = int(src_desc.size), int(dst_desc.size)
+
+        bad = (
+            (lens < 0)
+            | (offs_local < 0)
+            | (offs_remote < 0)
+            | (offs_local + lens > src_cap)
+            | (offs_remote + lens > dst_cap)
+        )
+        if not bad.any():
+            continue
+
+        j = int(np.flatnonzero(bad)[0])
+        raise ValueError(
+            f"[mori-bounds] {label}: desc pair {i}, entry {j} of {lens.size} escapes "
+            f"its registered region. "
+            f"local={int(offs_local[j])}+{int(lens[j])} vs src size={src_cap}; "
+            f"remote={int(offs_remote[j])}+{int(lens[j])} vs dst size={dst_cap}. "
+            f"n_bad={int(bad.sum())}, "
+            f"local span=[{int(offs_local.min())}, {int((offs_local + lens).max())}], "
+            f"remote span=[{int(offs_remote.min())}, {int((offs_remote + lens).max())}]"
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TransferTarget:
     info: TransferInfo
@@ -747,9 +794,20 @@ class MoriKVManager(CommonKVManager):
         src_desc: MemoryDesc,
         dst_desc: MemoryDesc,
         plan: BatchTransferPlan,
+        label: str = "kv",
     ) -> List[TransferStatus]:
         if plan.empty():
             return []
+
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            _validate_batch_write_bounds(
+                src_descs=[src_desc],
+                local_offsets=[plan.local_offsets],
+                dst_descs=[dst_desc],
+                remote_offsets=[plan.remote_offsets],
+                sizes=[plan.sizes],
+                label=label,
+            )
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
@@ -989,6 +1047,19 @@ class MoriKVManager(CommonKVManager):
         if num_kv_tokens is None:
             num_kv_tokens = capacity
         chunk_tokens = max(0, min(capacity, int(num_kv_tokens)))
+        if chunk_tokens > 0 and dst_kv_indices.size == 0:
+            # Dropping a non-empty chunk here is silent KV loss: the decode simply
+            # never receives these tokens and answers from whatever did arrive.
+            logger.warning(
+                "PD DCP relayout dropped a non-empty chunk: chunk_tokens=%d but the "
+                "destination page array is empty (src_page_offset=%d, dcp=%d/%d). "
+                "The decode is missing this KV.",
+                chunk_tokens,
+                src_page_offset,
+                peer_info.dst_dcp_rank,
+                peer_info.dst_dcp_size,
+            )
+            return []
         if chunk_tokens == 0 or dst_kv_indices.size == 0:
             return []
 
@@ -1012,6 +1083,25 @@ class MoriKVManager(CommonKVManager):
             )
         )
 
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            logger.info(
+                "[mori-bounds] dcp relayout: peer dcp=%d/%d, page=%d, chunk_tokens=%d, "
+                "src_page_offset=%d, decode_prefix_len=%d, owned_tokens=%d, groups=%d, "
+                "src token span=[%d, %d], dst token span=[%d, %d]",
+                peer_info.dst_dcp_rank,
+                peer_info.dst_dcp_size,
+                page_size,
+                chunk_tokens,
+                src_page_offset,
+                decode_prefix_len,
+                plan.src_token_indices.size,
+                len(grouped_plan.counts),
+                int(plan.src_token_indices.min()),
+                int(plan.src_token_indices.max()),
+                int(plan.dst_token_indices.min()),
+                int(plan.dst_token_indices.max()),
+            )
+
         if peer_info.decode_tp_size != self.attn_tp_size:
             raise ValueError(
                 "PD DCP relayout combined with TP-resharding is not supported "
@@ -1030,7 +1120,10 @@ class MoriKVManager(CommonKVManager):
                 )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
-                        src_descs[layer_id], dst_descs[layer_id], layer_plan
+                        src_descs[layer_id],
+                        dst_descs[layer_id],
+                        layer_plan,
+                        label=f"kv-dcp-mla-L{layer_id}",
                     )
                 )
             return statuses
@@ -1050,12 +1143,18 @@ class MoriKVManager(CommonKVManager):
             )
             statuses.extend(
                 self._submit_batch_transfer_plan(
-                    src_k_descs[layer_id], dst_k_descs[layer_id], layer_plan
+                    src_k_descs[layer_id],
+                    dst_k_descs[layer_id],
+                    layer_plan,
+                    label=f"kv-dcp-k-L{layer_id}",
                 )
             )
             statuses.extend(
                 self._submit_batch_transfer_plan(
-                    src_v_descs[layer_id], dst_v_descs[layer_id], layer_plan
+                    src_v_descs[layer_id],
+                    dst_v_descs[layer_id],
+                    layer_plan,
+                    label=f"kv-dcp-v-L{layer_id}",
                 )
             )
         return statuses
@@ -1097,6 +1196,15 @@ class MoriKVManager(CommonKVManager):
             remote_offsets.append([dst_aux_index * item_len])
             sizes.append([item_len])
             uids.append(self.engine.allocate_transfer_uid())
+        if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+            _validate_batch_write_bounds(
+                src_descs=src_descs,
+                local_offsets=local_offsets,
+                dst_descs=dst_descs,
+                remote_offsets=remote_offsets,
+                sizes=sizes,
+                label="aux",
+            )
         return list(
             self.engine.batch_write(
                 src_descs, local_offsets, dst_descs, remote_offsets, sizes, uids
@@ -1302,6 +1410,15 @@ class MoriKVManager(CommonKVManager):
                 size = bytes_to_send
 
             transfer_uid = self.engine.allocate_transfer_uid()
+            if envs.SGLANG_DEBUG_DISAGG_TRANSFER_BOUNDS.get():
+                _validate_batch_write_bounds(
+                    src_descs=[src_desc],
+                    local_offsets=[[src_offset]],
+                    dst_descs=[dst_desc],
+                    remote_offsets=[[dst_offset]],
+                    sizes=[[size]],
+                    label="state",
+                )
             batch_statuses = self.engine.batch_write(
                 [src_desc],
                 [[src_offset]],
@@ -1489,11 +1606,21 @@ class MoriKVManager(CommonKVManager):
                         and peer_info.dst_dcp_size > 1
                         and (self.is_mla_backend or self.is_hybrid_mla_backend)
                     ):
+                        # Pass the FULL destination page array, not dst_indices_chunk.
+                        # index_slice counts PREFILL pages (page_size), but a DCP decode
+                        # holds only its 1/dcp_size shard (virtual page =
+                        # page_size * dcp_size), so its page array is dcp_size times
+                        # shorter. Slicing it by a prefill-page range therefore runs off
+                        # the end on every chunk after the first and yields an empty
+                        # array -> the chunk is dropped and the decode silently loses
+                        # that KV. build_dcp_token_transfer_plan already locates the
+                        # right destination pages itself from src_page_offset, so it
+                        # wants the whole array.
                         result_statuses.extend(
                             self.send_kvcache_dcp(
                                 peer_info,
                                 kv_indices,
-                                dst_indices_chunk,
+                                info.dst_kv_indices,
                                 decode_prefix_len=info.decode_prefix_len or 0,
                                 num_kv_tokens=num_kv_tokens,
                                 src_page_offset=index_slice.start,

@@ -528,6 +528,14 @@ class KimiK3MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        self._preroute_routed_weight = None
+        self._preroute_routed_scale = None
+        self._preroute_shared_weight = None
+        self._preroute_shared_scale = None
+        self._preroute_shared_down_weight = None
+        self._preroute_shared_down_scale = None
+        self._situ_beta = float(config.activation_situ_beta)
+        self._situ_linear_beta = float(config.activation_situ_linear_beta)
 
         # SBO (single batch overlap): the shared experts read a fixed slab of
         # weights the routed path never touches (bf16 — the checkpoint leaves
@@ -643,6 +651,52 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+
+    def _prepare_preroute_fp8(self) -> None:
+        if (
+            not _aiter_moe_preroute_fp8
+            or not self.use_latent_moe
+            or self.shared_experts is None
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import (
+            moe_preroute_aiter_hip,
+        )
+        from sglang.kernels.ops.kimi_k3.aiter_fusion import (
+            quantize_fp8_rows,
+        )
+
+        routed = self.routed_expert_down_proj.weight
+        shared = self.shared_experts.gate_up_proj.weight
+        shared_down = self.shared_experts.down_proj.weight
+        if (
+            tuple(routed.shape) != (3584, 7168)
+            or tuple(shared.shape) != (1536, 7168)
+            or tuple(shared_down.shape) != (7168, 768)
+            or tuple(self.gate.weight.shape) != (896, 7168)
+        ):
+            return
+        self._preroute_routed_weight, self._preroute_routed_scale = quantize_fp8_rows(
+            routed.contiguous()
+        )
+        self._preroute_shared_weight, self._preroute_shared_scale = quantize_fp8_rows(
+            shared.contiguous()
+        )
+        (
+            self._preroute_shared_down_weight,
+            self._preroute_shared_down_scale,
+        ) = quantize_fp8_rows(shared_down.contiguous())
+        moe_preroute_aiter_hip.warmup(
+            self._preroute_routed_weight,
+            self._preroute_routed_scale,
+            self._preroute_shared_weight,
+            self._preroute_shared_scale,
+            self.gate.weight,
+            self._preroute_shared_down_weight,
+            self._preroute_shared_down_scale,
+            situ_beta=self._situ_beta,
+            situ_linear_beta=self._situ_linear_beta,
+        )
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1073,6 +1127,28 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        if (
+            self._preroute_shared_down_weight is not None
+            and self._preroute_shared_down_scale is not None
+        ):
+            from sglang.kernels.ops.kimi_k3 import (
+                moe_preroute_aiter_hip,
+            )
+
+            if moe_preroute_aiter_hip.shared_down_covered(
+                gate_up,
+                self._preroute_shared_down_weight,
+                self._preroute_shared_down_scale,
+            ):
+                moe_preroute_aiter_hip.run_shared_down(
+                    gate_up,
+                    self._preroute_shared_down_weight,
+                    self._preroute_shared_down_scale,
+                    situ_beta=self._situ_beta,
+                    situ_linear_beta=self._situ_linear_beta,
+                    out=shared_output,
+                )
+                return
         _k3_bf16_gemm(
             shared.act_fn(gate_up),
             shared.down_proj.weight,
@@ -1105,14 +1181,44 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        preroute = None
+        if (
+            num_tokens == 1
+            and self._preroute_routed_weight is not None
+            and self._preroute_routed_scale is not None
+            and self._preroute_shared_weight is not None
+            and self._preroute_shared_scale is not None
+        ):
+            from sglang.kernels.ops.kimi_k3 import (
+                moe_preroute_aiter_hip,
+            )
+
+            if moe_preroute_aiter_hip.tri_covered(
+                hidden_states,
+                self._preroute_routed_weight,
+                self._preroute_routed_scale,
+                self._preroute_shared_weight,
+                self._preroute_shared_scale,
+                self.gate.weight,
+            ):
+                routed_input, gate_up, router_logits = moe_preroute_aiter_hip.run_tri(
+                    hidden_states,
+                    self._preroute_routed_weight,
+                    self._preroute_routed_scale,
+                    self._preroute_shared_weight,
+                    self._preroute_shared_scale,
+                    self.gate.weight,
+                )
+                preroute = True
+        if preroute is None:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -3093,6 +3199,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                layer.mlp._prepare_preroute_fp8()
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast

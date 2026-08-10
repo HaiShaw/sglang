@@ -598,6 +598,8 @@ class KimiK3MoE(nn.Module):
         self._preroute_shared_scale = None
         self._preroute_shared_down_weight = None
         self._preroute_shared_down_scale = None
+        self._latent_tail_weight = None
+        self._latent_tail_scale = None
         self._situ_beta = float(config.activation_situ_beta)
         self._situ_linear_beta = float(config.activation_situ_linear_beta)
 
@@ -776,6 +778,29 @@ class KimiK3MoE(nn.Module):
             self._preroute_shared_down_scale,
             situ_beta=self._situ_beta,
             situ_linear_beta=self._situ_linear_beta,
+        )
+
+    def _prepare_latent_tail_fp8(self) -> None:
+        if (
+            not _aiter_latent_tail_fp8
+            or not self.fuse_ar_norm
+            or self.routed_expert_up_proj is None
+            or self.routed_expert_norm is None
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import latent_tail_aiter_hip
+
+        if tuple(self.routed_expert_up_proj.weight.shape) != (7168, 3584):
+            return
+        self._latent_tail_weight, self._latent_tail_scale = latent_tail_aiter_hip.pack(
+            self.routed_expert_up_proj.weight
+        )
+        norm_weight, epsilon = self._get_fused_norm_params()
+        latent_tail_aiter_hip.warmup(
+            norm_weight,
+            self._latent_tail_weight,
+            self._latent_tail_scale,
+            epsilon,
         )
 
     @cached_property
@@ -1357,12 +1382,18 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        use_latent_tail = (
+            num_tokens == 1
+            and self._latent_tail_weight is not None
+            and self._latent_tail_scale is not None
+        )
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
                 self._defer_moe_finalize
                 and self.fuse_ar_norm
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
+                and not use_latent_tail
             )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1393,12 +1424,15 @@ class KimiK3MoE(nn.Module):
                     *self._get_fused_norm_params(),
                 )
             elif self.fuse_ar_norm:
-                fused_norm = True
-                k3_ar_fusion.all_reduce_norm(
-                    latent.view(-1, self.moe_hidden_size),
-                    *self._get_fused_norm_params(),
-                    num_tokens=num_tokens,
-                )
+                if use_latent_tail:
+                    k3_ar_fusion.all_reduce(latent)
+                else:
+                    fused_norm = True
+                    k3_ar_fusion.all_reduce_norm(
+                        latent.view(-1, self.moe_hidden_size),
+                        *self._get_fused_norm_params(),
+                        num_tokens=num_tokens,
+                    )
             else:
                 k3_ar_fusion.all_reduce(latent)
             # the gemm_ag tail wants the normed latent straight out of the
@@ -1417,7 +1451,7 @@ class KimiK3MoE(nn.Module):
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            if self.fuse_ar_norm and k3_ar_fusion.enabled():
+            if self.fuse_ar_norm and k3_ar_fusion.enabled() and not use_latent_tail:
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
                     buf.view(-1, k3_ar_fusion.NORM_DIM),
@@ -1431,6 +1465,27 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if use_latent_tail and not fused_norm:
+            from sglang.kernels.ops.kimi_k3 import latent_tail_aiter_hip
+
+            norm_weight, epsilon = self._get_fused_norm_params()
+            if latent_tail_aiter_hip.covered(
+                latent,
+                shared_output,
+                norm_weight,
+                self._latent_tail_weight,
+                self._latent_tail_scale,
+                epsilon,
+            ):
+                out = latent_tail_aiter_hip.run(
+                    latent,
+                    shared_output,
+                    norm_weight,
+                    self._latent_tail_weight,
+                    self._latent_tail_scale,
+                    epsilon,
+                )
+                return out if prefix_sum is None else out + prefix_sum
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)
@@ -3353,6 +3408,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
                 layer.mlp._prepare_preroute_fp8()
+                layer.mlp._prepare_latent_tail_fp8()
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast

@@ -1690,6 +1690,8 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        self._kda_group64_weight = None
+        self._kda_group64_scale = None
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1729,6 +1731,31 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+
+    def _prepare_group64_projection(self) -> None:
+        if (
+            not _aiter_kda_group64
+            or not self.do_fuse_qkvbfg
+            or not self.use_full_rank_gate
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import kda_group64_aiter_hip
+
+        merged = torch.cat(
+            [
+                self.fused_qkvg_proj.weight,
+                self.b_proj.weight,
+                self.f_a_proj.weight,
+                self.f_a_proj.weight.new_zeros((4, self.hidden_size)),
+            ],
+            dim=0,
+        ).contiguous()
+        if tuple(merged.shape) != (6288, 7168):
+            return
+        weight, scale = kda_group64_aiter_hip.pack(merged)
+        self._kda_group64_weight = weight
+        self._kda_group64_scale = scale
+        kda_group64_aiter_hip.warmup(weight, scale)
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -1833,6 +1860,31 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
+            if (
+                defer_f_b
+                and self._kda_group64_weight is not None
+                and self._kda_group64_scale is not None
+            ):
+                from sglang.kernels.ops.kimi_k3 import (
+                    kda_group64_aiter_hip,
+                )
+
+                if kda_group64_aiter_hip.covered(
+                    hidden_states,
+                    self._kda_group64_weight,
+                    self._kda_group64_scale,
+                ):
+                    packed = kda_group64_aiter_hip.run(
+                        hidden_states,
+                        self._kda_group64_weight,
+                        self._kda_group64_scale,
+                    )
+                    mixed_qkv, g_proj_states, beta, f_a, _padding = torch.split(
+                        packed,
+                        [self.split_sizes[0], self.split_sizes[1], 12, 128, 4],
+                        dim=-1,
+                    )
+                    return mixed_qkv, beta, f_a, g_proj_states
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
@@ -3207,6 +3259,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     bias.data = bias.data.to(_bias_dtype)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
+                layer.self_attn._prepare_group64_projection()
                 layer.self_attn._prepare_fused_decode()
 
         for layer in self.model.layers:

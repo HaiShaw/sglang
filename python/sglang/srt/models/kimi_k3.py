@@ -137,6 +137,10 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_mla_gate = get_bool_env_var("SGLANG_K3_AITER_MLA_GATE")
+_aiter_kda_group64 = get_bool_env_var("SGLANG_K3_AITER_KDA_GROUP64")
+_aiter_moe_preroute_fp8 = get_bool_env_var("SGLANG_K3_AITER_MOE_PREROUTE_FP8")
+_aiter_latent_tail_fp8 = get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -2071,19 +2075,31 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # join across graph-segment boundaries.
                     torch.cuda.current_stream().wait_stream(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
-                    gate = (
-                        precomputed[0]
-                        if precomputed is not None
-                        else self.g_proj(gate_input)[0]
+                    from sglang.kernels.ops.kimi_k3 import (
+                        mla_gate_aiter_hip,
+                        mla_output_gate,
                     )
-                    from sglang.kernels.ops.kimi_k3 import mla_output_gate
 
-                    if mla_output_gate.covered(x, gate):
-                        # One kernel for x * sigmoid(gate); double rounding
-                        # matches the unfused pair bit-for-bit.
-                        x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
+                    if (
+                        precomputed is None
+                        and _aiter_mla_gate
+                        and mla_gate_aiter_hip.covered(
+                            gate_input, self.g_proj.weight, x
+                        )
+                    ):
+                        x = mla_gate_aiter_hip.run(gate_input, self.g_proj.weight, x)
                     else:
-                        x = x * torch.sigmoid(gate)
+                        gate = (
+                            precomputed[0]
+                            if precomputed is not None
+                            else self.g_proj(gate_input)[0]
+                        )
+                        if mla_output_gate.covered(x, gate):
+                            # One kernel for x * sigmoid(gate); double rounding
+                            # matches the unfused pair bit-for-bit.
+                            x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
+                        else:
+                            x = x * torch.sigmoid(gate)
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2096,7 +2112,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         so its memory cannot be reused while the alt stream still writes."""
         self._gate_precomputed = None
         if (
-            self._gate_alt_stream is not None
+            not _aiter_mla_gate
+            and self._gate_alt_stream is not None
             and get_is_capture_mode()
             # The attention-core break ends the segment between the alt-stream
             # event record and the o_proj-side wait, so under breakable capture
@@ -3146,6 +3163,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            if _aiter_mla_gate and isinstance(self_attn, KimiK3MLAAttention):
+                from sglang.kernels.ops.kimi_k3 import mla_gate_aiter_hip
+
+                mla_gate_aiter_hip.warmup(self_attn.g_proj.weight)
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the

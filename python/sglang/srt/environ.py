@@ -1516,6 +1516,9 @@ class Envs:
     # Radix-4 top-k for the K3 router on gfx942/gfx950. Preserves AITER's tie
     # and NaN semantics; falls back to the reference top-k elsewhere.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Prepend an SGLang-shipped BF16 tuned-GEMM profile for M=16384 to AITER's
+    # config search path. Read before any import can initialize AITER_CONFIGS.
+    SGLANG_K3_AITER_M16384_PROFILE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

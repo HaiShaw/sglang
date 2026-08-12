@@ -15,6 +15,13 @@ def enabled() -> bool:
     ).lower() in ("1", "true")
 
 
+def _b2_enabled() -> bool:
+    return os.environ.get("SGLANG_K3_AITER_B2_FUSIONS", "0").lower() in (
+        "1",
+        "true",
+    )
+
+
 def _ops():
     try:
         from aiter.ops.flydsl.kimi_k3_moe_preroute_fp8 import (
@@ -42,6 +49,8 @@ def tri_covered(
     router_weight: torch.Tensor,
 ) -> bool:
     if not enabled():
+        return False
+    if hidden.shape[0] > 1 and (hidden.shape[0] != 2 or not _b2_enabled()):
         return False
     _, _, supports, _ = _ops()
     return bool(
@@ -85,6 +94,8 @@ def shared_down_covered(
 ) -> bool:
     if not enabled():
         return False
+    if gate_up.shape[0] > 1 and (gate_up.shape[0] != 2 or not _b2_enabled()):
+        return False
     _, _, _, supports = _ops()
     return bool(supports is not None and supports(gate_up, weight, scale))
 
@@ -125,32 +136,38 @@ def warmup(
 ) -> None:
     if not enabled():
         return
-    hidden = torch.zeros((1, 7168), dtype=torch.bfloat16, device=routed_weight.device)
-    if not tri_covered(
-        hidden,
-        routed_weight,
-        routed_scale,
-        shared_weight,
-        shared_scale,
-        router_weight,
-    ):
-        return
-    _, gate_up, _ = run_tri(
-        hidden,
-        routed_weight,
-        routed_scale,
-        shared_weight,
-        shared_scale,
-        router_weight,
-    )
-    out = hidden.new_empty((1, 7168))
-    if shared_down_covered(gate_up, shared_down_weight, shared_down_scale):
-        run_shared_down(
-            gate_up,
-            shared_down_weight,
-            shared_down_scale,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            out=out,
+    token_buckets = (1, 2) if _b2_enabled() else (1,)
+    for num_tokens in token_buckets:
+        hidden = torch.zeros(
+            (num_tokens, 7168),
+            dtype=torch.bfloat16,
+            device=routed_weight.device,
         )
+        if not tri_covered(
+            hidden,
+            routed_weight,
+            routed_scale,
+            shared_weight,
+            shared_scale,
+            router_weight,
+        ):
+            continue
+        _, gate_up, _ = run_tri(
+            hidden,
+            routed_weight,
+            routed_scale,
+            shared_weight,
+            shared_scale,
+            router_weight,
+        )
+        out = hidden.new_empty((num_tokens, 7168))
+        if shared_down_covered(gate_up, shared_down_weight, shared_down_scale):
+            run_shared_down(
+                gate_up,
+                shared_down_weight,
+                shared_down_scale,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                out=out,
+            )
     torch.cuda.synchronize(hidden.device)

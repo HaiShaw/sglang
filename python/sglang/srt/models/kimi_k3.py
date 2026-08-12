@@ -1208,7 +1208,7 @@ class KimiK3MoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         preroute = None
         if (
-            num_tokens == 1
+            num_tokens <= 2
             and self._preroute_routed_weight is not None
             and self._preroute_routed_scale is not None
             and self._preroute_shared_weight is not None

@@ -18,13 +18,15 @@ def enabled() -> bool:
 
 def _ops():
     try:
-        from aiter.ops.flydsl.kimi_k3_mla_gate import (
-            kimi_k3_mla_gate,
-            supports_kimi_k3_mla_gate,
+        from sglang.kernels.ops.kimi_k3.flydsl.source import load_module
+
+        module = load_module(
+            "sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_mla_gate",
+            "aiter.ops.flydsl.kimi_k3_mla_gate",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None
-    return kimi_k3_mla_gate, supports_kimi_k3_mla_gate
+    return module.kimi_k3_mla_gate, module.supports_kimi_k3_mla_gate
 
 
 def covered(

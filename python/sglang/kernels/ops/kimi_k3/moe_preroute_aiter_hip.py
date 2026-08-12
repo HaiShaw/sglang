@@ -24,19 +24,19 @@ def _b2_enabled() -> bool:
 
 def _ops():
     try:
-        from aiter.ops.flydsl.kimi_k3_moe_preroute_fp8 import (
-            kimi_k3_moe_tri_projection_fp8,
-            kimi_k3_shared_down_fp8,
-            supports_kimi_k3_moe_tri_projection_fp8,
-            supports_kimi_k3_shared_down_fp8,
+        from sglang.kernels.ops.kimi_k3.flydsl.source import load_module
+
+        module = load_module(
+            "sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_moe_preroute_fp8",
+            "aiter.ops.flydsl.kimi_k3_moe_preroute_fp8",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None, None, None
     return (
-        kimi_k3_moe_tri_projection_fp8,
-        kimi_k3_shared_down_fp8,
-        supports_kimi_k3_moe_tri_projection_fp8,
-        supports_kimi_k3_shared_down_fp8,
+        module.kimi_k3_moe_tri_projection_fp8,
+        module.kimi_k3_shared_down_fp8,
+        module.supports_kimi_k3_moe_tri_projection_fp8,
+        module.supports_kimi_k3_shared_down_fp8,
     )
 
 

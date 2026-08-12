@@ -17,17 +17,18 @@ def enabled() -> bool:
 
 def _ops():
     try:
-        from aiter.ops.flydsl.latent_moe_tail_fp8 import (
-            latent_moe_tail_fp8,
-            quantize_latent_moe_tail_weight,
-            supports_latent_moe_tail_fp8,
+        from sglang.kernels.ops.kimi_k3.flydsl.source import load_module
+
+        module = load_module(
+            "sglang.kernels.ops.kimi_k3.flydsl.latent_moe_tail_fp8",
+            "aiter.ops.flydsl.latent_moe_tail_fp8",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None, None
     return (
-        latent_moe_tail_fp8,
-        quantize_latent_moe_tail_weight,
-        supports_latent_moe_tail_fp8,
+        module.latent_moe_tail_fp8,
+        module.quantize_latent_moe_tail_weight,
+        module.supports_latent_moe_tail_fp8,
     )
 
 

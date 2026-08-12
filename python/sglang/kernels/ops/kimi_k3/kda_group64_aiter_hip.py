@@ -25,17 +25,18 @@ def _b2_enabled() -> bool:
 
 def _ops():
     try:
-        from aiter.ops.flydsl.kimi_k3_kda_input_group64 import (
-            kimi_k3_kda_input_group64,
-            quantize_kimi_k3_kda_input_group64,
-            supports_kimi_k3_kda_input_group64,
+        from sglang.kernels.ops.kimi_k3.flydsl.source import load_module
+
+        module = load_module(
+            "sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_input_group64",
+            "aiter.ops.flydsl.kimi_k3_kda_input_group64",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None, None
     return (
-        kimi_k3_kda_input_group64,
-        quantize_kimi_k3_kda_input_group64,
-        supports_kimi_k3_kda_input_group64,
+        module.kimi_k3_kda_input_group64,
+        module.quantize_kimi_k3_kda_input_group64,
+        module.supports_kimi_k3_kda_input_group64,
     )
 
 

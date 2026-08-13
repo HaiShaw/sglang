@@ -1077,14 +1077,7 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # ===================================================================
-    # Kernel selection and fused backends
-    # ===================================================================
-    # MiniCPM sparse attention developer switches
-    SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
-    SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
-    SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
-
+    # ============================================================
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
@@ -1493,6 +1486,10 @@ class Envs:
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
+    # Opt-in Kimi-K3 gfx950 MLA decode path: fuse identity-RoPE Q
+    # materialization, Q concat and latent KV-cache write into AITER's
+    # per-head kernel. Fail closed to the existing split/cat/cache chain.
+    SGLANG_K3_AITER_MLA_Q_CACHE_FUSION = EnvBool(False)
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)

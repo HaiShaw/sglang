@@ -30,7 +30,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _STARTUP_MODULE = (

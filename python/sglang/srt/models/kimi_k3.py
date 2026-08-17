@@ -2363,14 +2363,19 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         sin_cache = self._k3_identity_rope_sin
         if (
             not isinstance(scale, torch.Tensor)
+            or not isinstance(self._k3_mla_q_cache_scale, torch.Tensor)
             or cos_cache is None
             or sin_cache is None
         ):
             return None
 
+        # AITER decode uses FP8 Q when the cache is FP8. Triton decode keeps
+        # Q/Q-PE in BF16 while sharing the same fused FP8 cache write.
+        triton_decode = self.current_attention_backend in ("triton", "triton_mla")
+        q_out_dtype = q_nope_out.dtype if triton_decode else kv_cache.dtype
         out = torch.empty(
             (*q_nope_out.shape[:-1], self.kv_lora_rank + self.qk_rope_head_dim),
-            dtype=kv_cache.dtype,
+            dtype=q_out_dtype,
             device=q_nope_out.device,
         )
         if not mla_q_cache_aiter_hip.covered(
@@ -2385,6 +2390,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             cos_cache,
             sin_cache,
             out,
+            self._k3_mla_q_cache_scale,
         ):
             return None
         q = mla_q_cache_aiter_hip.run(
@@ -2399,6 +2405,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             out=out,
+            q_scale=self._k3_mla_q_cache_scale,
         )
         k_placeholder = torch.empty(
             (k_nope.shape[0], 1, self.kv_lora_rank + self.qk_rope_head_dim),

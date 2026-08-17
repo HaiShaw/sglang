@@ -27,7 +27,7 @@ def _enable(monkeypatch):
     monkeypatch.setenv("SGLANG_K3_AITER_MLA_Q_CACHE_FUSION", "1")
 
 
-def _inputs(tokens: int, cache_dtype=torch.bfloat16):
+def _inputs(tokens: int, cache_dtype=torch.bfloat16, output_dtype=None):
     torch.manual_seed(23)
     heads = 12
     q_nope = torch.randn(
@@ -53,24 +53,41 @@ def _inputs(tokens: int, cache_dtype=torch.bfloat16):
         "slot_mapping": torch.arange(tokens, device="cuda", dtype=torch.int64),
         "positions": torch.arange(tokens, device="cuda", dtype=torch.int64),
         "k_scale": torch.ones(1, device="cuda", dtype=torch.float32),
+        "q_scale": torch.ones(1, device="cuda", dtype=torch.float32),
         "cos_cache": torch.ones(1, 32, device="cuda", dtype=torch.bfloat16),
         "sin_cache": torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
-        "out": torch.empty(tokens, heads, 576, device="cuda", dtype=cache_dtype),
+        "out": torch.empty(
+            tokens,
+            heads,
+            576,
+            device="cuda",
+            dtype=cache_dtype if output_dtype is None else output_dtype,
+        ),
     }
 
 
 def _reference(values):
-    dtype = values["kv_cache"].dtype
     return (
-        torch.cat((values["q_nope"], values["q_pe"]), dim=-1).to(dtype),
-        torch.cat((values["k_nope"], values["k_pe"]), dim=-1).to(dtype),
+        torch.cat((values["q_nope"], values["q_pe"]), dim=-1).to(
+            values["out"].dtype
+        ),
+        torch.cat((values["k_nope"], values["k_pe"]), dim=-1).to(
+            values["kv_cache"].dtype
+        ),
     )
 
 
 @pytest.mark.parametrize("tokens", [1, 64])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, dtypes.fp8])
-def test_fused_mla_q_cache_identity_rope(tokens, cache_dtype):
-    values = _inputs(tokens, cache_dtype)
+@pytest.mark.parametrize(
+    ("cache_dtype", "output_dtype"),
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (dtypes.fp8, dtypes.fp8),
+        (dtypes.fp8, torch.bfloat16),
+    ],
+)
+def test_fused_mla_q_cache_identity_rope(tokens, cache_dtype, output_dtype):
+    values = _inputs(tokens, cache_dtype, output_dtype)
     expected_q, expected_k = _reference(values)
     actual = mla_q_cache_aiter_hip.run(**values)
     torch.cuda.synchronize()

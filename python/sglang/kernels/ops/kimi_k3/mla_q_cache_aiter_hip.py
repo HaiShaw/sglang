@@ -70,10 +70,12 @@ def covered(
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     out: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
 ) -> bool:
     if not available(q_nope.device) or q_nope.ndim != 3:
         return False
     tokens, heads, _ = q_nope.shape
+    q_scale = k_scale if q_scale is None else q_scale
     return (
         tokens > 0
         and q_nope.shape == (tokens, heads, _KV_LORA_RANK)
@@ -96,6 +98,9 @@ def covered(
         and k_scale.numel() == 1
         and k_scale.dtype == torch.float32
         and k_scale.device == q_nope.device
+        and q_scale.numel() == 1
+        and q_scale.dtype == torch.float32
+        and q_scale.device == q_nope.device
         and cos_cache.shape == (1, _PE_DIM // 2)
         and sin_cache.shape == (1, _PE_DIM // 2)
         and cos_cache.dtype == torch.bfloat16
@@ -103,7 +108,10 @@ def covered(
         and cos_cache.device == q_nope.device
         and sin_cache.device == q_nope.device
         and out.shape == (tokens, heads, _HEAD_DIM)
-        and out.dtype == kv_cache.dtype
+        # AITER decode consumes FP8 Q alongside FP8 KV, while Triton decode
+        # keeps Q in BF16 and only stores KV as FP8. The AITER fused operator
+        # supports q_out and kv_cache with independent dtypes.
+        and out.dtype in (q_nope.dtype, kv_cache.dtype)
         and out.is_contiguous()
     )
 
@@ -121,7 +129,9 @@ def run(
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     out: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    q_scale = k_scale if q_scale is None else q_scale
     if not covered(
         q_nope,
         q_pe,
@@ -134,11 +144,12 @@ def run(
         cos_cache,
         sin_cache,
         out,
+        q_scale,
     ):
         raise NotImplementedError(
             "Kimi-K3 fused MLA Q/cache requires contiguous gfx950 BF16 inputs, "
             "a page-compatible 576-wide BF16/FP8 cache, int64 slot/position "
-            "vectors, scalar FP32 scale, identity RoPE buffers and matching output"
+            "vectors, scalar FP32 scale, identity RoPE buffers and BF16/FP8 output"
         )
     op = _op()
     if op is None:
@@ -152,7 +163,7 @@ def run(
         out,
         slot_mapping,
         k_scale,
-        k_scale,
+        q_scale,
         positions,
         cos_cache,
         sin_cache,

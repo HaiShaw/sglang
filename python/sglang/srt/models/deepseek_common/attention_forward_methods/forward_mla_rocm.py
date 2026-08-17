@@ -709,7 +709,7 @@ class DeepseekMLARocmForwardMixin:
             k3_fused_q_cache = getattr(self, "_try_fused_mla_q_cache", None)
             if (
                 k3_fused_q_cache is not None
-                and self.current_attention_backend == "aiter"
+                and self.current_attention_backend in ("aiter", "triton", "triton_mla")
                 and not get_parallel().dcp_enabled
                 and forward_batch.forward_mode.is_decode_or_idle()
             ):

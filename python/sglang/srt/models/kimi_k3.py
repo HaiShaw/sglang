@@ -596,6 +596,8 @@ class KimiK3MoE(nn.Module):
         self._preroute_routed_scale = None
         self._preroute_shared_weight = None
         self._preroute_shared_scale = None
+        self._preroute_shared_interleaved_weight = None
+        self._preroute_shared_interleaved_scale = None
         self._preroute_shared_down_weight = None
         self._preroute_shared_down_scale = None
         self._latent_tail_weight = None
@@ -764,6 +766,19 @@ class KimiK3MoE(nn.Module):
         self._preroute_shared_weight, self._preroute_shared_scale = quantize_fp8_rows(
             shared.contiguous()
         )
+        if moe_preroute_aiter_hip.cooperative_preactivated_enabled():
+            self._preroute_shared_interleaved_weight = (
+                self._preroute_shared_weight.view(2, 768, 7168)
+                .permute(1, 0, 2)
+                .contiguous()
+                .view(1536, 7168)
+            )
+            self._preroute_shared_interleaved_scale = (
+                self._preroute_shared_scale.view(2, 768)
+                .t()
+                .contiguous()
+                .view(1536)
+            )
         (
             self._preroute_shared_down_weight,
             self._preroute_shared_down_scale,
@@ -776,6 +791,8 @@ class KimiK3MoE(nn.Module):
             self.gate.weight,
             self._preroute_shared_down_weight,
             self._preroute_shared_down_scale,
+            self._preroute_shared_interleaved_weight,
+            self._preroute_shared_interleaved_scale,
             situ_beta=self._situ_beta,
             situ_linear_beta=self._situ_linear_beta,
         )
@@ -1259,13 +1276,26 @@ class KimiK3MoE(nn.Module):
         finally:
             route_quant_handoff.clear()
 
-    def _forward_shared(self, gate_up, shared_output):
+    def _forward_shared(
+        self,
+        gate_up,
+        shared_output,
+        *,
+        preactivated: bool = False,
+    ):
         shared = self.shared_experts
         if TYPE_CHECKING:
             assert shared is not None and isinstance(
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        if preactivated:
+            _k3_bf16_gemm(
+                gate_up,
+                shared.down_proj.weight,
+                out=shared_output,
+            )
+            return
         if (
             self._preroute_shared_down_weight is not None
             and self._preroute_shared_down_scale is not None
@@ -1321,8 +1351,9 @@ class KimiK3MoE(nn.Module):
 
         num_tokens, hidden_size = hidden_states.shape
         preroute = None
+        shared_is_preactivated = False
         if (
-            num_tokens <= 2
+            num_tokens <= 4
             and self._preroute_routed_weight is not None
             and self._preroute_routed_scale is not None
             and self._preroute_shared_weight is not None
@@ -1332,7 +1363,33 @@ class KimiK3MoE(nn.Module):
                 moe_preroute_aiter_hip,
             )
 
-            if moe_preroute_aiter_hip.tri_covered(
+            if (
+                self._preroute_shared_interleaved_weight is not None
+                and self._preroute_shared_interleaved_scale is not None
+                and moe_preroute_aiter_hip.cooperative_preactivated_tri_covered(
+                    hidden_states,
+                    self._preroute_routed_weight,
+                    self._preroute_routed_scale,
+                    self._preroute_shared_interleaved_weight,
+                    self._preroute_shared_interleaved_scale,
+                    self.gate.weight,
+                )
+            ):
+                routed_input, gate_up, router_logits = (
+                    moe_preroute_aiter_hip.run_tri_cooperative_preactivated(
+                        hidden_states,
+                        self._preroute_routed_weight,
+                        self._preroute_routed_scale,
+                        self._preroute_shared_interleaved_weight,
+                        self._preroute_shared_interleaved_scale,
+                        self.gate.weight,
+                        situ_beta=self._situ_beta,
+                        situ_linear_beta=self._situ_linear_beta,
+                    )
+                )
+                shared_is_preactivated = True
+                preroute = True
+            elif moe_preroute_aiter_hip.tri_covered(
                 hidden_states,
                 self._preroute_routed_weight,
                 self._preroute_routed_scale,
@@ -1404,7 +1461,11 @@ class KimiK3MoE(nn.Module):
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
             with torch.cuda.stream(self.alt_stream):
-                self._forward_shared(gate_up, shared_output)
+                self._forward_shared(
+                    gate_up,
+                    shared_output,
+                    preactivated=shared_is_preactivated,
+                )
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
                 k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
@@ -1449,7 +1510,11 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
+            self._forward_shared(
+                gate_up,
+                shared_output,
+                preactivated=shared_is_preactivated,
+            )
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if self.fuse_ar_norm and k3_ar_fusion.enabled() and not use_latent_tail:
                 fused_norm = True

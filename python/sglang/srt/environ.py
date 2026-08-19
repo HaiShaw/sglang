@@ -797,6 +797,11 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Fold the Kimi-K3 KDA [f_a|b] tail into the wide [q,k,v,g] projection.
+    # The merged N=6288 shape is selected only while decode remains bandwidth
+    # bound; larger token counts retain the tuned N=6144 split path.
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 
@@ -1467,6 +1472,16 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Route Kimi-K3's non-EP merged BF16 MoE front through AITER tuned_gemm.
+    # This is independently gated so the AITER config contribution can be
+    # measured without enabling latent MXFP4.
+    SGLANG_K3_AITER_TUNED_MOE_FRONT = EnvBool(False)
+    SGLANG_K3_AITER_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(48)
+    SGLANG_K3_AITER_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(192)
+    # Keep packed MXFP4 copies of the non-EP latent down/up projections and use
+    # them only for large token batches. BF16 weights remain live as fallback.
+    SGLANG_K3_MOE_LATENT_MXFP4 = EnvBool(False)
+    SGLANG_K3_MOE_LATENT_MXFP4_MIN_TOKENS = EnvInt(2048)
     # Master switch for the ROCm AITER K3 decode path: the MXFP4 SiTU MoE
     # runner, the fused MoE front and the AITER-backed attention projections.
     SGLANG_AITER_K3_OPT = EnvBool(False)

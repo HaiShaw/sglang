@@ -10,6 +10,7 @@ import logging
 import os
 from collections.abc import Iterable
 from functools import cached_property
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -1669,6 +1670,8 @@ class KimiK3DeltaAttention(nn.Module):
             # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
             # in as well skews the output dim to 6284 and measurably degrades
             # the GEMM kernel selection; they stay as separate tiny GEMVs.
+            # ROCm can reverse this below a configurable token threshold; see
+            # _merge_kda_inproj_weights_hip().
             self.fused_qkvg_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [
@@ -1718,6 +1721,16 @@ class KimiK3DeltaAttention(nn.Module):
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
             self._bfa_f_b_w: Optional[torch.Tensor] = None
+            if _is_hip:
+                # Optional ROCm layout [q,k,v,g | f_a | b | pad]. The original
+                # wide projection and [f_a|b] tail remain views so larger token
+                # counts and the exact-M1/M2 group64 path keep their existing
+                # weights and dispatch.
+                self._qkvgbfa_layer: Optional[SimpleNamespace] = None
+                self._qkvgbfa_sizes: Optional[list[int]] = None
+                self._qkvgbfa_bs_limit = (
+                    envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
+                )
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1943,6 +1956,16 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        # ROCm KDA in-proj fusion and the ModelOpt block-FP8 merge were built
+        # independently; the fused path builds plain views and never sets
+        # _bfa_f_b_w, so keep it off the block-FP8 checkpoints entirely.
+        if (
+            _is_hip
+            and not self._bfa_uses_block_fp8
+            and self._merge_kda_inproj_weights_hip()
+        ):
+            self._bfa_f_b_w = self.f_b_proj.weight
+            return
         mods = [self.f_a_proj, self.b_proj]
         if self._bfa_uses_block_fp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
@@ -1956,6 +1979,45 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+
+    def _merge_kda_inproj_weights_hip(self) -> bool:
+        """Merge the ROCm KDA input projections while retaining split views."""
+        if not self._may_fuse_kda_inproj():
+            return False
+
+        merged, sizes = _merge_weights_as_views(
+            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj], pad_rows_to=8
+        )
+        self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
+        self._bfa_w = merged[sizes[0] :]
+        # Keep this out of the module tree: it is only a layer-shaped carrier
+        # for the existing unquantized linear method and must not duplicate
+        # the merged parameter in state_dict.
+        self._qkvgbfa_layer = SimpleNamespace(weight=merged)
+        self._qkvgbfa_sizes = [
+            *self.split_sizes,
+            self._bfa_fa_size,
+            self._bfa_b_size,
+            merged.shape[0] - sum(sizes),
+        ]
+        return True
+
+    def _may_fuse_kda_inproj(self) -> bool:
+        """Return whether the KDA weights can safely share one ROCm GEMM."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
+            return False
+        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+            return False
+        weights = [
+            module.weight
+            for module in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)
+        ]
+        if not all(
+            type(weight.data) is torch.Tensor and weight.dim() == 2
+            for weight in weights
+        ):
+            return False
+        return len({(weight.dtype, weight.shape[1]) for weight in weights}) == 1
 
     def _prepare_group64_projection(self) -> None:
         if (
@@ -2114,6 +2176,23 @@ class KimiK3DeltaAttention(nn.Module):
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
+
+                if (
+                    _is_hip
+                    and self._qkvgbfa_sizes is not None
+                    and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
+                ):
+                    fused_states = self.fused_qkvg_proj.quant_method.apply(
+                        self._qkvgbfa_layer, hidden_states, None
+                    )
+                    qkv, g_proj_states, f_a, beta, _padding = torch.split(
+                        fused_states, self._qkvgbfa_sizes, dim=-1
+                    )
+                    # The existing ROCm fused KDA boundary consumes f_a and
+                    # folds f_b into the recurrence kernel. Preserve that
+                    # handoff instead of reintroducing the removed f_b launch.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self.f_b_proj.weight)
+                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     self._bfa_alt_stream is not None

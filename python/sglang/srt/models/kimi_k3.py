@@ -136,11 +136,13 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-_aiter_mla_gate = get_bool_env_var("SGLANG_K3_AITER_MLA_GATE")
-_aiter_kda_group64 = get_bool_env_var("SGLANG_K3_AITER_KDA_GROUP64")
-_aiter_moe_preroute_fp8 = get_bool_env_var("SGLANG_K3_AITER_MOE_PREROUTE_FP8")
-_aiter_latent_tail_fp8 = get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
+_aiter_k3_opt = _is_hip and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_mla_gate = _is_hip and get_bool_env_var("SGLANG_K3_AITER_MLA_GATE")
+_aiter_kda_group64 = _is_hip and get_bool_env_var("SGLANG_K3_AITER_KDA_GROUP64")
+_aiter_moe_preroute_fp8 = _is_hip and get_bool_env_var(
+    "SGLANG_K3_AITER_MOE_PREROUTE_FP8"
+)
+_aiter_latent_tail_fp8 = _is_hip and get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -774,10 +776,7 @@ class KimiK3MoE(nn.Module):
                 .view(1536, 7168)
             )
             self._preroute_shared_interleaved_scale = (
-                self._preroute_shared_scale.view(2, 768)
-                .t()
-                .contiguous()
-                .view(1536)
+                self._preroute_shared_scale.view(2, 768).t().contiguous().view(1536)
             )
         (
             self._preroute_shared_down_weight,
@@ -2266,9 +2265,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
-        self._k3_mla_q_cache_fusion = (
-            envs.SGLANG_K3_AITER_MLA_Q_CACHE_FUSION.get()
-        )
+        self._k3_mla_q_cache_fusion = envs.SGLANG_K3_AITER_MLA_Q_CACHE_FUSION.get()
         if self._k3_mla_q_cache_fusion:
             self.register_buffer(
                 "_k3_identity_rope_cos",

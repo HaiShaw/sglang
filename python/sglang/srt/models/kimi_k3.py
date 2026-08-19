@@ -144,6 +144,15 @@ _aiter_moe_preroute_fp8 = _is_hip and get_bool_env_var(
 _aiter_latent_tail_fp8 = _is_hip and get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
+_k3_aiter_tuned_moe_front = _is_hip and envs.SGLANG_K3_AITER_TUNED_MOE_FRONT.get()
+_k3_aiter_tuned_moe_front_min_tokens = (
+    envs.SGLANG_K3_AITER_TUNED_MOE_FRONT_MIN_TOKENS.get()
+)
+_k3_aiter_tuned_moe_front_max_tokens = (
+    envs.SGLANG_K3_AITER_TUNED_MOE_FRONT_MAX_TOKENS.get()
+)
+_moe_latent_mxfp4 = _is_hip and envs.SGLANG_K3_MOE_LATENT_MXFP4.get()
+_moe_latent_mxfp4_min_tokens = envs.SGLANG_K3_MOE_LATENT_MXFP4_MIN_TOKENS.get()
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -166,8 +175,8 @@ def _k3_bf16_gemm(
 ) -> torch.Tensor:
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
-    shared down GEMM call torch directly on raw merged weights, so the
-    --bf16-gemm-backend cutedsl selection would silently skip them."""
+    shared down GEMM call torch directly on raw merged weights, so neither the
+    optional AITER tuned selection nor --bf16-gemm-backend reaches them."""
     if out is None and out_dtype is not None and out_dtype != x.dtype:
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
@@ -186,6 +195,21 @@ def _k3_bf16_gemm(
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
+        if (
+            out is None
+            and _use_aiter
+            and _k3_aiter_tuned_moe_front
+            and (
+                _k3_aiter_tuned_moe_front_min_tokens
+                <= x.shape[0]
+                <= _k3_aiter_tuned_moe_front_max_tokens
+            )
+            and tuple(weight.shape) == (6016, 7168)
+            and type(weight.data) is torch.Tensor
+        ):
+            from aiter.tuned_gemm import tgemm
+
+            return tgemm.mm(x, weight, None, otype=x.dtype)
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
@@ -583,6 +607,11 @@ class KimiK3MoE(nn.Module):
         self._preroute_shared_down_scale = None
         self._latent_tail_weight = None
         self._latent_tail_scale = None
+        self._front_head = None
+        self._front_down_w4 = None
+        self._front_down_scale4 = None
+        self._latent_up_w4 = None
+        self._latent_up_scale4 = None
         self._situ_beta = float(config.activation_situ_beta)
         self._situ_linear_beta = float(config.activation_situ_linear_beta)
 
@@ -716,6 +745,48 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+
+    def _prepare_moe_latent_mxfp4(self) -> None:
+        """Pack non-EP latent projections for the large-M MXFP4 path."""
+        if (
+            not _moe_latent_mxfp4
+            or not self.use_latent_moe
+            or not self._eligible_for_fused_front
+            or self._front_sizes is None
+            or len(self._front_sizes) != 3
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import latent_mxfp4_aiter_hip
+
+        if not latent_mxfp4_aiter_hip.supported():
+            return
+        head_rows = self._front_sizes[0] + self._front_sizes[1]
+        front_head = self._front_w[:head_rows]
+        down = self._front_w[head_rows:]
+        up = self.routed_expert_up_proj.weight
+        if (
+            tuple(down.shape) != (3584, 7168)
+            or tuple(up.shape) != (7168, 3584)
+            or down.dtype != torch.bfloat16
+            or up.dtype != torch.bfloat16
+        ):
+            return
+        self._front_head = front_head
+        self._front_down_w4, self._front_down_scale4 = latent_mxfp4_aiter_hip.pack(
+            down, "latent down_proj"
+        )
+        self._latent_up_w4, self._latent_up_scale4 = latent_mxfp4_aiter_hip.pack(
+            up, "latent up_proj"
+        )
+
+    def _use_moe_latent_mxfp4(self, num_tokens: int) -> bool:
+        return (
+            self._front_down_w4 is not None
+            and self._front_down_scale4 is not None
+            and self._latent_up_w4 is not None
+            and self._latent_up_scale4 is not None
+            and num_tokens >= _moe_latent_mxfp4_min_tokens
+        )
 
     def _prepare_preroute_fp8(self) -> None:
         if (
@@ -1331,6 +1402,7 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
+        use_mxfp4 = self._use_moe_latent_mxfp4(num_tokens)
         preroute = None
         shared_is_preactivated = False
         if (
@@ -1388,14 +1460,29 @@ class KimiK3MoE(nn.Module):
                 )
                 preroute = True
         if preroute is None:
-            fused = _k3_bf16_gemm(
-                hidden_states,
-                self._front_w,
-                out_dtype=torch.float32 if self._front_fp32 else None,
-            )
-            gate_up, router_logits, routed_input = torch.split(
-                fused, self._front_sizes, dim=-1
-            )
+            if use_mxfp4:
+                from sglang.kernels.ops.kimi_k3 import latent_mxfp4_aiter_hip
+
+                head = _k3_bf16_gemm(
+                    hidden_states,
+                    self._front_head,
+                    out_dtype=torch.float32 if self._front_fp32 else None,
+                )
+                gate_up, router_logits = torch.split(
+                    head, self._front_sizes[:2], dim=-1
+                )
+                routed_input = latent_mxfp4_aiter_hip.run(
+                    hidden_states, self._front_down_w4, self._front_down_scale4
+                )
+            else:
+                fused = _k3_bf16_gemm(
+                    hidden_states,
+                    self._front_w,
+                    out_dtype=torch.float32 if self._front_fp32 else None,
+                )
+                gate_up, router_logits, routed_input = torch.split(
+                    fused, self._front_sizes, dim=-1
+                )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1481,6 +1568,7 @@ class KimiK3MoE(nn.Module):
             # fused-norm AR (its GEMV chains on it via PDL)
             if (
                 fused_norm
+                and not use_mxfp4
                 and self._gemm_ag_up_eligible
                 and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
             ):
@@ -1534,7 +1622,14 @@ class KimiK3MoE(nn.Module):
                 return out if prefix_sum is None else out + prefix_sum
         if not fused_norm:
             latent = self._latent_norm(latent)
-        out, _ = self.routed_expert_up_proj(latent)
+        if use_mxfp4:
+            from sglang.kernels.ops.kimi_k3 import latent_mxfp4_aiter_hip
+
+            out = latent_mxfp4_aiter_hip.run(
+                latent, self._latent_up_w4, self._latent_up_scale4
+            )
+        else:
+            out, _ = self.routed_expert_up_proj(latent)
 
         # prefetch_bc: b (shared_output) was produced by the all-reduce and
         # c (prefix_sum) even earlier; the AR is a plain launch (full
@@ -3589,6 +3684,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                layer.mlp._prepare_moe_latent_mxfp4()
                 layer.mlp._prepare_preroute_fp8()
                 layer.mlp._prepare_latent_tail_fp8()
                 # The router consumes the correction bias in fp32; convert the

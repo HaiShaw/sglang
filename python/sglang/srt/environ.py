@@ -1498,6 +1498,16 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Route Kimi-K3's non-EP merged BF16 MoE front through AITER tuned_gemm.
+    # This is independently gated so the AITER config contribution can be
+    # measured without enabling latent MXFP4.
+    SGLANG_K3_AITER_TUNED_MOE_FRONT = EnvBool(False)
+    SGLANG_K3_AITER_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(48)
+    SGLANG_K3_AITER_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(192)
+    # Keep packed MXFP4 copies of the non-EP latent down/up projections and use
+    # them only for large token batches. BF16 weights remain live as fallback.
+    SGLANG_K3_MOE_LATENT_MXFP4 = EnvBool(False)
+    SGLANG_K3_MOE_LATENT_MXFP4_MIN_TOKENS = EnvInt(2048)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

@@ -787,6 +787,11 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Fold the Kimi-K3 KDA [f_a|b] tail into the wide [q,k,v,g] projection.
+    # The merged N=6288 shape is selected only while decode remains bandwidth
+    # bound; larger token counts retain the tuned N=6144 split path.
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 

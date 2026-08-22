@@ -5941,6 +5941,23 @@ class ServerArgs:
             else:
                 return "triton"
 
+    @staticmethod
+    def _aiter_long_context_mem_fraction_factor(
+        pinned_attention_backend: Optional[str], context_len: int
+    ) -> float:
+        """Workspace haircut for AITER long-context launches.
+
+        Applied only when the caller pinned ``--attention-backend aiter``.
+        Split launches such as ``--attention-backend triton
+        --prefill-attention-backend aiter --decode-attention-backend aiter``
+        must keep the caller's ``--mem-fraction-static`` so the KV pool can
+        still be sized. Do not read ``resolved_view``: both split fields being
+        aiter aliases the resolved base field to aiter.
+        """
+        if pinned_attention_backend == "aiter" and context_len > 8192:
+            return 0.85
+        return 1.0
+
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
 
@@ -6028,10 +6045,17 @@ class ServerArgs:
 
         run_post_process_pass(self, _fa4_page_constraint)
 
-        # AMD platforms backends
-        if resolved_view(self).attention_backend == "aiter":
-            if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+        # AMD platforms backends.
+        # Key off the operator-pinned ``--attention-backend``, not
+        # ``resolved_view``. When both split backends are aiter,
+        # ``_attention_backend_default`` aliases the base field to aiter on
+        # the resolved view. Multiplying an explicit ``--mem-fraction-static``
+        # (K3 uses 0.85) by 0.85 then yields 0.7225, which is below the KV
+        # pool floor after large MoE weights (~0.743 on MI355X TP8).
+        if self.mem_fraction_static is not None:
+            self.mem_fraction_static *= self._aiter_long_context_mem_fraction_factor(
+                self.attention_backend, model_config.context_len
+            )
 
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)

@@ -2112,7 +2112,11 @@ def _deterministic_attention_backend(view: Any) -> dict:
 def _attention_backend_default(view: Any) -> dict:
     if view.prefill_attention_backend is not None and (
         view.prefill_attention_backend == view.decode_attention_backend
-    ):  # override the default attention backend
+    ):  # alias the default attention backend
+        # This aliases the *resolved* base field. Callers that need the
+        # operator-pinned ``--attention-backend`` (e.g. the AITER long-context
+        # mem_fraction haircut) must read ``self.attention_backend`` before
+        # materialization, not ``resolved_view``.
         return {"attention_backend": view.prefill_attention_backend}
     if view.attention_backend is None:
         backend = view._get_default_attn_backend(

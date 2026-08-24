@@ -133,7 +133,8 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_aiter_k3_opt = _is_hip and envs.SGLANG_AITER_K3_OPT.get()
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
@@ -1077,6 +1078,10 @@ class KimiK3MoE(nn.Module):
     def _moe_front_needs_dense_bf16(self) -> bool:
         """Whether routed_input must be repaired into a dense bf16 buffer.
 
+        AITER's K3 MXFP8 activation route indexes rows by input.stride(-2), so
+        it can consume the fused-front split view directly. Other AITER
+        quantization routes are not used by this K3 path.
+
         Only the SM100 trtllm-gen mxfp4 runner reads the front slice as it
         comes: its group quant (route_quant_fused / per_token_group_quant)
         takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
@@ -1084,6 +1089,10 @@ class KimiK3MoE(nn.Module):
         skips it as well, so those keep the bf16 contract even though the
         runner backend is the same."""
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        runner = getattr(self.experts, "runner", None)
+        if runner is not None and runner.runner_backend.is_aiter():
+            return False
 
         method = self.experts.quant_method
         return not (
@@ -3044,10 +3053,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast
-                # kernel per MoE layer per step.
+                # kernel per MoE layer per step. If aiter, the router takes the
+                # gate-logit dtype instead, so match that one to the same end.
                 bias = layer.mlp.gate.e_score_correction_bias
-                if bias.dtype != torch.float32:
-                    bias.data = bias.data.to(torch.float32)
+                _bias_dtype = (
+                    layer.mlp.gate.weight.dtype if _use_aiter else torch.float32
+                )
+                if bias.dtype != _bias_dtype:
+                    bias.data = bias.data.to(_bias_dtype)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()

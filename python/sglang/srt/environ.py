@@ -1513,6 +1513,9 @@ class Envs:
     # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for the
     # KDA group64 projection, so the per-bucket tuning can be A/B'd in place.
     SGLANG_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
+    # Radix-4 top-k for the K3 router on gfx942/gfx950. Preserves AITER's tie
+    # and NaN semantics; falls back to the reference top-k elsewhere.
+    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

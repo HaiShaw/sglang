@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
@@ -230,6 +230,32 @@ class TopKConfig:
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
+    _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _correction_bias_cache_key: Optional[Tuple] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def correction_bias_for_dtype(self, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """Return correction bias in ``dtype``, reusing a per-TopK lazy copy."""
+        correction_bias = self.correction_bias
+        if correction_bias is None or correction_bias.dtype == dtype:
+            return correction_bias
+
+        # Weight loaders update parameters in place. Including the version in
+        # the key prevents an early access from retaining pre-load contents.
+        cache_key = (
+            correction_bias.data_ptr(),
+            correction_bias._version,
+            correction_bias.device,
+            correction_bias.dtype,
+            dtype,
+        )
+        if self._correction_bias_cache_key != cache_key:
+            self._correction_bias_dtype_cache = correction_bias.to(dtype=dtype)
+            self._correction_bias_cache_key = cache_key
+        return self._correction_bias_dtype_cache
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -1571,17 +1597,32 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+
+        from sglang.kernels.ops.moe import moe_route_radix4
+
+        if (
+            moe_route_radix4.enabled()
+            and moe_route_radix4.available()
+            and moe_route_radix4.covered(
+                gating_output, correction_bias, topk, num_expert_group, topk_group
+            )
+        ):
+            return moe_route_radix4.route_radix4(
+                gating_output, correction_bias, topk, renormalize, scaling
+            )
+
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            correction_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
             topk_group,
             renormalize,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            scaling,
         )
         return topk_weights, topk_ids
     elif _is_musa and (
@@ -2124,6 +2165,9 @@ def select_experts(
 
     # Set by the fused-gating+pack branch below; None everywhere else.
     packed_topk = None
+
+    if _use_aiter and use_grouped_topk and correction_bias is not None:
+        correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
     (
         router_logits,

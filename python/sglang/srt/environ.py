@@ -1482,6 +1482,17 @@ class Envs:
     # them only for large token batches. BF16 weights remain live as fallback.
     SGLANG_K3_MOE_LATENT_MXFP4 = EnvBool(False)
     SGLANG_K3_MOE_LATENT_MXFP4_MIN_TOKENS = EnvInt(2048)
+    # PTPC FP8 (per-token activation, per-channel weight) for the BF16 decode
+    # projections the checkpoint leaves unquantized. Halves the weight bytes
+    # those HBM-bound GEMMs stream. The router gate stays BF16 -- FP8 logits
+    # move the top-k selection.
+    SGLANG_K3_PTPC_FP8 = EnvBool(False)
+    SGLANG_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
+    SGLANG_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
+    # Below this batch the projections are launch-latency bound rather than
+    # weight-bandwidth bound, so the extra activation-quant launch costs more
+    # than the halved weight traffic saves.
+    SGLANG_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
     # Master switch for the ROCm AITER K3 decode path: the MXFP4 SiTU MoE
     # runner, the fused MoE front and the AITER-backed attention projections.
     SGLANG_AITER_K3_OPT = EnvBool(False)
@@ -1493,7 +1504,7 @@ class Envs:
     SGLANG_K3_AITER_MOE_PREROUTE_FP8 = EnvBool(False)
     SGLANG_K3_AITER_LATENT_TAIL_FP8 = EnvBool(False)
     # Extend the KDA and MoE pre-route fusions from the single-token bucket to
-    # two tokens. Superseded by SGLANG_K3_PREROUTE_PREACTIVATED_SHARED for MoE.
+    # two tokens.
     SGLANG_K3_AITER_B2_FUSIONS = EnvBool(False)
     # Route two- and four-token MoE decode through the cooperative FlyDSL
     # tri-projection, which returns the shared expert already SiTU-activated.

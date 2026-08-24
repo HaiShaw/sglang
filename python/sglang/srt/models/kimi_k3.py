@@ -151,6 +151,14 @@ _k3_aiter_tuned_moe_front_max_tokens = (
 )
 _moe_latent_mxfp4 = _is_hip and envs.SGLANG_K3_MOE_LATENT_MXFP4.get()
 _moe_latent_mxfp4_min_tokens = envs.SGLANG_K3_MOE_LATENT_MXFP4_MIN_TOKENS.get()
+_k3_ptpc_fp8 = _is_hip and envs.SGLANG_K3_PTPC_FP8.get()
+_k3_ptpc_fp8_max_tokens = envs.SGLANG_K3_PTPC_FP8_MAX_TOKENS.get()
+_k3_ptpc_fp8_min_tokens = envs.SGLANG_K3_PTPC_FP8_MIN_TOKENS.get()
+_k3_ptpc_fp8_shared_down = _is_hip and envs.SGLANG_K3_PTPC_FP8_SHARED_DOWN.get()
+
+
+def _k3_ptpc_fp8_batch_ok(num_tokens: int) -> bool:
+    return _k3_ptpc_fp8_min_tokens <= num_tokens <= _k3_ptpc_fp8_max_tokens
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -596,6 +604,12 @@ class KimiK3MoE(nn.Module):
         self._preroute_shared_down_scale = None
         self._latent_tail_weight = None
         self._latent_tail_scale = None
+        self._latent_up_fp8_w = None
+        self._latent_up_fp8_s = None
+        self._latent_up_fp8_n = 0
+        self._shared_down_fp8_w = None
+        self._shared_down_fp8_s = None
+        self._shared_down_fp8_n = 0
         self._front_head = None
         self._front_down_w4 = None
         self._front_down_scale4 = None
@@ -833,6 +847,68 @@ class KimiK3MoE(nn.Module):
             self._preroute_shared_interleaved_scale,
             situ_beta=self._situ_beta,
             situ_linear_beta=self._situ_linear_beta,
+        )
+
+    def _use_latent_up_ptpc_fp8(self, latent: torch.Tensor) -> bool:
+        if self._latent_up_fp8_w is None or not _k3_ptpc_fp8_batch_ok(latent.shape[0]):
+            return False
+        from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+        return ptpc_fp8_aiter_hip.covered(latent, self._latent_up_fp8_w)
+
+    def _prepare_latent_up_ptpc_fp8(self) -> None:
+        """Quantize the latent up-projection for the PTPC FP8 decode path."""
+        if not _k3_ptpc_fp8 or self.routed_expert_up_proj is None:
+            return
+        from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+        weight = self.routed_expert_up_proj.weight
+        if (
+            not ptpc_fp8_aiter_hip.available()
+            or not isinstance(weight, torch.Tensor)
+            or weight.dtype != torch.bfloat16
+            or weight.ndim != 2
+        ):
+            return
+        out_features, in_features = weight.shape
+        (
+            self._latent_up_fp8_w,
+            self._latent_up_fp8_s,
+            self._latent_up_fp8_n,
+        ) = ptpc_fp8_aiter_hip.pack(weight.contiguous())
+        ptpc_fp8_aiter_hip.warmup(
+            self._latent_up_fp8_w,
+            self._latent_up_fp8_s,
+            self._latent_up_fp8_n,
+            in_features,
+        )
+
+    def _prepare_shared_down_ptpc_fp8(self) -> None:
+        """Quantize the shared-expert down projection for decode."""
+        if not _k3_ptpc_fp8_shared_down or self.shared_experts is None:
+            return
+        from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+        weight = self.shared_experts.down_proj.weight
+        if (
+            not ptpc_fp8_aiter_hip.available()
+            or not isinstance(weight, torch.Tensor)
+            or weight.dtype != torch.bfloat16
+            or weight.ndim != 2
+        ):
+            return
+        out_features, in_features = weight.shape
+        (
+            self._shared_down_fp8_w,
+            self._shared_down_fp8_s,
+            self._shared_down_fp8_n,
+        ) = ptpc_fp8_aiter_hip.pack(weight.contiguous())
+        ptpc_fp8_aiter_hip.warmup(
+            self._shared_down_fp8_w,
+            self._shared_down_fp8_s,
+            self._shared_down_fp8_n,
+            in_features,
+            token_buckets=(8, 16, 32, 64, 128, 256),
         )
 
     def _prepare_latent_tail_fp8(self) -> None:
@@ -1314,6 +1390,23 @@ class KimiK3MoE(nn.Module):
         finally:
             route_quant_handoff.clear()
 
+    def _run_shared_down(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        shared = self.shared_experts
+        assert shared is not None
+        if self._shared_down_fp8_w is not None and _k3_ptpc_fp8_batch_ok(x.shape[0]):
+            from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+            if ptpc_fp8_aiter_hip.covered(x, self._shared_down_fp8_w):
+                ptpc_fp8_aiter_hip.run(
+                    x,
+                    self._shared_down_fp8_w,
+                    self._shared_down_fp8_s,
+                    self._shared_down_fp8_n,
+                    out=out,
+                )
+                return
+        _k3_bf16_gemm(x, shared.down_proj.weight, out=out)
+
     def _forward_shared(
         self,
         gate_up,
@@ -1328,11 +1421,7 @@ class KimiK3MoE(nn.Module):
             )
         assert shared is not None
         if preactivated:
-            _k3_bf16_gemm(
-                gate_up,
-                shared.down_proj.weight,
-                out=shared_output,
-            )
+            self._run_shared_down(gate_up, shared_output)
             return
         if (
             self._preroute_shared_down_weight is not None
@@ -1356,11 +1445,7 @@ class KimiK3MoE(nn.Module):
                     out=shared_output,
                 )
                 return
-        _k3_bf16_gemm(
-            shared.act_fn(gate_up),
-            shared.down_proj.weight,
-            out=shared_output,
-        )
+        self._run_shared_down(shared.act_fn(gate_up), shared_output)
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -1622,6 +1707,15 @@ class KimiK3MoE(nn.Module):
             out = latent_mxfp4_aiter_hip.run(
                 latent, self._latent_up_w4, self._latent_up_scale4
             )
+        elif self._use_latent_up_ptpc_fp8(latent):
+            from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+            out = ptpc_fp8_aiter_hip.run(
+                latent,
+                self._latent_up_fp8_w,
+                self._latent_up_fp8_s,
+                self._latent_up_fp8_n,
+            )
         else:
             out, _ = self.routed_expert_up_proj(latent)
 
@@ -1801,6 +1895,9 @@ class KimiK3DeltaAttention(nn.Module):
                 self._qkvgbfa_bs_limit = (
                     envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
+                self._qkvgbfa_fp8_w: Optional[torch.Tensor] = None
+                self._qkvgbfa_fp8_s: Optional[torch.Tensor] = None
+                self._qkvgbfa_fp8_n = 0
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -2055,6 +2152,43 @@ class KimiK3DeltaAttention(nn.Module):
         ]
         return True
 
+    def _use_qkvgbfa_ptpc_fp8(self, hidden_states: torch.Tensor) -> bool:
+        if getattr(self, "_qkvgbfa_fp8_w", None) is None or not _k3_ptpc_fp8_batch_ok(
+            hidden_states.shape[0]
+        ):
+            return False
+        from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+        return ptpc_fp8_aiter_hip.covered(hidden_states, self._qkvgbfa_fp8_w)
+
+    def _prepare_qkvgbfa_ptpc_fp8(self) -> None:
+        """Quantize the merged KDA input projection for PTPC FP8 decode."""
+        layer = getattr(self, "_qkvgbfa_layer", None)
+        if not _k3_ptpc_fp8 or layer is None:
+            return
+        from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+        weight = layer.weight
+        if (
+            not ptpc_fp8_aiter_hip.available()
+            or not isinstance(weight, torch.Tensor)
+            or weight.dtype != torch.bfloat16
+            or weight.ndim != 2
+        ):
+            return
+        out_features, in_features = weight.shape
+        (
+            self._qkvgbfa_fp8_w,
+            self._qkvgbfa_fp8_s,
+            self._qkvgbfa_fp8_n,
+        ) = ptpc_fp8_aiter_hip.pack(weight.contiguous())
+        ptpc_fp8_aiter_hip.warmup(
+            self._qkvgbfa_fp8_w,
+            self._qkvgbfa_fp8_s,
+            self._qkvgbfa_fp8_n,
+            in_features,
+        )
+
     def _may_fuse_kda_inproj(self) -> bool:
         """Return whether the KDA weights can safely share one ROCm GEMM."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
@@ -2235,9 +2369,19 @@ class KimiK3DeltaAttention(nn.Module):
                     and self._qkvgbfa_sizes is not None
                     and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
                 ):
-                    fused_states = self.fused_qkvg_proj.quant_method.apply(
-                        self._qkvgbfa_layer, hidden_states, None
-                    )
+                    if self._use_qkvgbfa_ptpc_fp8(hidden_states):
+                        from sglang.kernels.ops.kimi_k3 import ptpc_fp8_aiter_hip
+
+                        fused_states = ptpc_fp8_aiter_hip.run(
+                            hidden_states,
+                            self._qkvgbfa_fp8_w,
+                            self._qkvgbfa_fp8_s,
+                            self._qkvgbfa_fp8_n,
+                        )
+                    else:
+                        fused_states = self.fused_qkvg_proj.quant_method.apply(
+                            self._qkvgbfa_layer, hidden_states, None
+                        )
                     qkv, g_proj_states, f_a, beta, _padding = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
@@ -3685,6 +3829,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.mlp._prepare_moe_latent_mxfp4()
                 layer.mlp._prepare_preroute_fp8()
                 layer.mlp._prepare_latent_tail_fp8()
+                layer.mlp._prepare_latent_up_ptpc_fp8()
+                layer.mlp._prepare_shared_down_ptpc_fp8()
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast
@@ -3700,6 +3846,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_group64_projection()
                 layer.self_attn._prepare_fused_decode()
+                layer.self_attn._prepare_qkvgbfa_ptpc_fp8()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

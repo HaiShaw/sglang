@@ -93,7 +93,9 @@ def supports_latent_moe_tail_fp8(
 
 
 @functools.cache
-def _compiled_latent_moe_tail_fp8(num_tokens: int, add_prefix: bool):
+def _compiled_latent_moe_tail_fp8(
+    num_tokens: int, add_prefix: bool, skip_rms: bool = False
+):
     from .kernels.latent_moe_tail_fp8_gfx950 import (
         build_latent_moe_tail_fp8_persistent_module,
     )
@@ -101,6 +103,7 @@ def _compiled_latent_moe_tail_fp8(num_tokens: int, add_prefix: bool):
     return build_latent_moe_tail_fp8_persistent_module(
         num_tokens=num_tokens,
         add_prefix=add_prefix,
+        skip_rms=skip_rms,
         rows_per_wave=1,
         cu_count=240,
         waves_per_eu=2,
@@ -118,6 +121,7 @@ def latent_moe_tail_fp8(
     *,
     prefix: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    skip_rms: bool = False,
 ) -> torch.Tensor:
     """Fuse RMSNorm, FP8-weight GEMV, BF16 materialization, and shared add."""
 
@@ -146,7 +150,7 @@ def latent_moe_tail_fp8(
     from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
     prefix_arg = prefix if prefix is not None else shared
-    _compiled_latent_moe_tail_fp8(int(routed.shape[0]), prefix is not None)(
+    _compiled_latent_moe_tail_fp8(int(routed.shape[0]), prefix is not None, skip_rms)(
         ptr_arg(routed),
         ptr_arg(shared),
         ptr_arg(rms_weight),

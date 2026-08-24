@@ -1192,6 +1192,13 @@ class KimiK3MoE(nn.Module):
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
         if not self._routed_needs_reduce:
             return self._latent_norm(latent)
+        if self.fuse_ar_norm:
+            from sglang.srt.layers.k3_fused_ar_rmsnorm import try_fused_ar_rmsnorm
+
+            weight, eps = self._get_fused_norm_params()
+            fused = try_fused_ar_rmsnorm(latent, weight, eps)
+            if fused is not None:
+                return fused[0]
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1590,6 +1597,7 @@ class KimiK3MoE(nn.Module):
             and self._latent_tail_scale is not None
         )
         fused_norm = False
+        fused_normed_latent = None
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
                 self._defer_moe_finalize
@@ -1672,11 +1680,33 @@ class KimiK3MoE(nn.Module):
             elif k3_ar_fusion.enabled():
                 k3_ar_fusion.all_reduce(buf)
             else:
-                buf = tensor_model_parallel_all_reduce(buf)
+                if self.fuse_ar_norm and not use_latent_tail:
+                    from sglang.srt.layers.k3_fused_ar_rmsnorm import (
+                        try_fused_ar_rmsnorm,
+                    )
+
+                    weight, eps = self._get_fused_norm_params()
+                    view = buf.view(-1, k3_ar_fusion.NORM_DIM)
+                    fused = try_fused_ar_rmsnorm(
+                        view,
+                        weight,
+                        eps,
+                        num_norm_rows=num_tokens,
+                    )
+                    if fused is not None:
+                        normed, reduced = fused
+                        if reduced.data_ptr() != view.data_ptr():
+                            buf.copy_(reduced.reshape(-1))
+                        fused_normed_latent = normed[:num_tokens]
+                        fused_norm = True
+                if fused_normed_latent is None:
+                    buf = tensor_model_parallel_all_reduce(buf)
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        if use_latent_tail and not fused_norm:
+        if fused_normed_latent is not None:
+            latent = fused_normed_latent
+        if use_latent_tail:
             from sglang.kernels.ops.kimi_k3 import latent_tail_aiter_hip
 
             norm_weight, epsilon = self._get_fused_norm_params()
@@ -1697,6 +1727,7 @@ class KimiK3MoE(nn.Module):
                     self._latent_tail_scale,
                     epsilon,
                     prefix_sum,
+                    skip_rms=fused_norm,
                 )
                 return out
         if not fused_norm:

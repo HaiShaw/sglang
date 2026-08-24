@@ -70,6 +70,7 @@ def run(
     up_scale: torch.Tensor,
     epsilon: float,
     prefix: torch.Tensor | None = None,
+    skip_rms: bool = False,
 ) -> torch.Tensor:
     op, _, _ = _ops()
     if op is None:
@@ -82,6 +83,7 @@ def run(
         up_scale,
         epsilon,
         prefix=prefix,
+        skip_rms=skip_rms,
     )
 
 
@@ -110,5 +112,24 @@ def warmup(
                 up_scale,
                 epsilon,
                 prefix=torch.zeros_like(shared),
+            )
+            run(
+                routed,
+                shared,
+                rms_weight,
+                up_weight,
+                up_scale,
+                epsilon,
+                skip_rms=True,
+            )
+            run(
+                routed,
+                shared,
+                rms_weight,
+                up_weight,
+                up_scale,
+                epsilon,
+                prefix=torch.zeros_like(shared),
+                skip_rms=True,
             )
         torch.cuda.synchronize(up_weight.device)

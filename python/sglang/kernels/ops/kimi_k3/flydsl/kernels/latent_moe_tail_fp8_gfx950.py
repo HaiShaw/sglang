@@ -45,6 +45,7 @@ def _raw(value):
 def build_latent_moe_tail_fp8_persistent_module(
     num_tokens: int = 1,
     add_prefix: bool = False,
+    skip_rms: bool = False,
     rows_per_wave: int = 2,
     cu_count: int = 256,
     waves_per_eu: int = 0,
@@ -79,7 +80,7 @@ def build_latent_moe_tail_fp8_persistent_module(
 
     kernel_name = (
         f"latent_moe_tail_b{num_tokens}_bf16_fp8_persistent_gfx950"
-        f"_prefix{int(add_prefix)}"
+        f"_prefix{int(add_prefix)}_skiprms{int(skip_rms)}"
         f"_rpw{rows_per_wave}_cu{cu_count}_wpb{waves_per_block}"
         f"_wpe{waves_per_eu}_wcm{weight_cache_modifier}"
     )
@@ -221,80 +222,94 @@ def build_latent_moe_tail_fp8_persistent_module(
             tid,
             arith.constant(_NORMALIZE_THREADS, type=i32),
         )
-        # Every persistent block needs the normalized token rows in its own
-        # LDS. Normalize tokens one at a time with the same fixed reduction
-        # order as B1. B2 could normalize both rows in parallel in 896 threads,
-        # but keeping one schedule for B1/B2/B4 makes numerical validation and
-        # compilation predictable; the projection's weight stream dominates.
-        for token_index in range_constexpr(num_tokens):
-            token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
-            rms_base = arith.constant(token_index * _NORMALIZE_WAVES, type=i32)
-            token = arith.constant(token_index, type=i32)
+        # Every persistent block needs the token rows in its own LDS.
+        # skip_rms: the caller already fused RMSNorm into the 1-stage
+        # all-reduce, so just copy the pre-normed latent. Otherwise
+        # normalize tokens one at a time with the same fixed reduction
+        # order as B1.
+        if const_expr(skip_rms):
+            for token_index in range_constexpr(num_tokens):
+                token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
+                copy_if = scf.IfOp(normalize_thread)
+                with ir.InsertionPoint(copy_if.then_block):
+                    row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
+                    element_index = token_base + row_element
+                    routed_bf16 = load_bf16x8(routed_rsrc, element_index)
+                    fx.ptr_store(routed_bf16, hidden_lds + element_index)
+                    scf.YieldOp([])
+                gpu.barrier()
+        else:
+            for token_index in range_constexpr(num_tokens):
+                token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
+                rms_base = arith.constant(token_index * _NORMALIZE_WAVES, type=i32)
+                token = arith.constant(token_index, type=i32)
 
-            normalize_if = scf.IfOp(normalize_thread, results_=[f32], has_else=True)
-            with ir.InsertionPoint(normalize_if.then_block):
-                row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
-                element_index = token_base + row_element
-                routed_bf16 = load_bf16x8(routed_rsrc, element_index)
-                routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
-                local_square_sum = (routed_f32 * routed_f32).reduce(
-                    ReductionOp.ADD, fastmath=fm_fast
-                )
-                scf.YieldOp([_raw(local_square_sum)])
-            with ir.InsertionPoint(normalize_if.else_block):
-                scf.YieldOp([zero_f32])
-            wave_square_sum = wave_reduce_add(normalize_if.results[0])
-
-            is_normalize_lane_zero = arith.andi(
-                arith.cmpi(
-                    CmpIPredicate.eq,
-                    lane,
-                    arith.constant(0, type=i32),
-                ),
-                arith.cmpi(
-                    CmpIPredicate.ult,
-                    wave,
-                    arith.constant(_NORMALIZE_WAVES, type=i32),
-                ),
-            )
-            lane_zero_if = scf.IfOp(is_normalize_lane_zero)
-            with ir.InsertionPoint(lane_zero_if.then_block):
-                lds_store(rms_sums, wave_square_sum, rms_base + wave)
-                scf.YieldOp([])
-            gpu.barrier()
-
-            is_thread_zero = arith.cmpi(
-                CmpIPredicate.eq, tid, arith.constant(0, type=i32)
-            )
-            thread_zero_if = scf.IfOp(is_thread_zero)
-            with ir.InsertionPoint(thread_zero_if.then_block):
-                total_square_sum = ArithValue(zero_f32)
-                for wave_index in range_constexpr(_NORMALIZE_WAVES):
-                    total_square_sum = total_square_sum + lds_load(
-                        rms_sums,
-                        rms_base + arith.constant(wave_index, type=i32),
+                normalize_if = scf.IfOp(normalize_thread, results_=[f32], has_else=True)
+                with ir.InsertionPoint(normalize_if.then_block):
+                    row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
+                    element_index = token_base + row_element
+                    routed_bf16 = load_bf16x8(routed_rsrc, element_index)
+                    routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
+                    local_square_sum = (routed_f32 * routed_f32).reduce(
+                        ReductionOp.ADD, fastmath=fm_fast
                     )
-                variance = total_square_sum * ArithValue(
-                    arith.constant(1.0 / _LATENT_DIM, type=f32)
-                )
-                inverse = fmath.rsqrt(variance + ArithValue(epsilon), fastmath=fm_fast)
-                lds_store(inverse_rms, _raw(inverse), token)
-                scf.YieldOp([])
-            gpu.barrier()
+                    scf.YieldOp([_raw(local_square_sum)])
+                with ir.InsertionPoint(normalize_if.else_block):
+                    scf.YieldOp([zero_f32])
+                wave_square_sum = wave_reduce_add(normalize_if.results[0])
 
-            normalize_store_if = scf.IfOp(normalize_thread)
-            with ir.InsertionPoint(normalize_store_if.then_block):
-                row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
-                element_index = token_base + row_element
-                routed_bf16 = load_bf16x8(routed_rsrc, element_index)
-                gamma_bf16 = load_bf16x8(rms_weight_rsrc, row_element)
-                routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
-                gamma_f32 = ArithValue(gamma_bf16).extf(vec8_f32)
-                inverse = ArithValue(lds_load(inverse_rms, token))
-                normalized = (routed_f32 * gamma_f32 * inverse).truncf(vec8_bf16)
-                fx.ptr_store(normalized, hidden_lds + element_index)
-                scf.YieldOp([])
-            gpu.barrier()
+                is_normalize_lane_zero = arith.andi(
+                    arith.cmpi(
+                        CmpIPredicate.eq,
+                        lane,
+                        arith.constant(0, type=i32),
+                    ),
+                    arith.cmpi(
+                        CmpIPredicate.ult,
+                        wave,
+                        arith.constant(_NORMALIZE_WAVES, type=i32),
+                    ),
+                )
+                lane_zero_if = scf.IfOp(is_normalize_lane_zero)
+                with ir.InsertionPoint(lane_zero_if.then_block):
+                    lds_store(rms_sums, wave_square_sum, rms_base + wave)
+                    scf.YieldOp([])
+                gpu.barrier()
+
+                is_thread_zero = arith.cmpi(
+                    CmpIPredicate.eq, tid, arith.constant(0, type=i32)
+                )
+                thread_zero_if = scf.IfOp(is_thread_zero)
+                with ir.InsertionPoint(thread_zero_if.then_block):
+                    total_square_sum = ArithValue(zero_f32)
+                    for wave_index in range_constexpr(_NORMALIZE_WAVES):
+                        total_square_sum = total_square_sum + lds_load(
+                            rms_sums,
+                            rms_base + arith.constant(wave_index, type=i32),
+                        )
+                    variance = total_square_sum * ArithValue(
+                        arith.constant(1.0 / _LATENT_DIM, type=f32)
+                    )
+                    inverse = fmath.rsqrt(
+                        variance + ArithValue(epsilon), fastmath=fm_fast
+                    )
+                    lds_store(inverse_rms, _raw(inverse), token)
+                    scf.YieldOp([])
+                gpu.barrier()
+
+                normalize_store_if = scf.IfOp(normalize_thread)
+                with ir.InsertionPoint(normalize_store_if.then_block):
+                    row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
+                    element_index = token_base + row_element
+                    routed_bf16 = load_bf16x8(routed_rsrc, element_index)
+                    gamma_bf16 = load_bf16x8(rms_weight_rsrc, row_element)
+                    routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
+                    gamma_f32 = ArithValue(gamma_bf16).extf(vec8_f32)
+                    inverse = ArithValue(lds_load(inverse_rms, token))
+                    normalized = (routed_f32 * gamma_f32 * inverse).truncf(vec8_bf16)
+                    fx.ptr_store(normalized, hidden_lds + element_index)
+                    scf.YieldOp([])
+                gpu.barrier()
 
         first_group = (
             ArithValue(gpu.block_idx.x) * arith.constant(waves_per_block, type=i32)

@@ -141,6 +141,54 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
     assert not torch.equal(previous, actual)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    reason="Kimi-K3 FP8 latent-tail specialization requires gfx950",
+)
+@torch.inference_mode()
+def test_latent_moe_tail_fp8_skip_rms_uses_pre_normalized_hidden():
+    generator = torch.Generator(device="cpu").manual_seed(20260823)
+    routed = torch.randn((1, LATENT_DIM), generator=generator).bfloat16().cuda()
+    shared = torch.randn((1, HIDDEN_DIM), generator=generator).bfloat16().cuda()
+    rms_weight = torch.randn(LATENT_DIM, generator=generator).bfloat16().cuda()
+    up_weight = (
+        torch.randn((HIDDEN_DIM, LATENT_DIM), generator=generator)
+        .mul_(LATENT_DIM**-0.5)
+        .bfloat16()
+        .cuda()
+    )
+    packed, scale = quantize_latent_moe_tail_weight(up_weight)
+    inv_rms = torch.rsqrt(routed.float().square().mean(dim=-1, keepdim=True) + EPSILON)
+    normalized = (routed.float() * inv_rms * rms_weight.float()).bfloat16()
+    dequantized = packed.float() * scale[:, None]
+    oracle = (
+        torch.mm(normalized.float(), dequantized.t()).bfloat16().float()
+        + shared.float()
+    ).bfloat16()
+
+    actual = latent_moe_tail_fp8(
+        normalized,
+        shared,
+        rms_weight,
+        packed,
+        scale,
+        EPSILON,
+        skip_rms=True,
+    )
+    torch.testing.assert_close(actual, oracle, rtol=0.01, atol=0.015625)
+    # Double-normalizing the already-normed row must not match.
+    double_normed = latent_moe_tail_fp8(
+        normalized,
+        shared,
+        rms_weight,
+        packed,
+        scale,
+        EPSILON,
+        skip_rms=False,
+    )
+    assert not torch.equal(actual, double_normed)
+
+
 if __name__ == "__main__":
     import sys
 

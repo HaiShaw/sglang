@@ -1529,6 +1529,9 @@ class Envs:
     # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for the
     # KDA group64 projection, so the per-bucket tuning can be A/B'd in place.
     SGLANG_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
+    # Per-bank-depth num_warps / waves_per_eu for the ROCm attention-residual
+    # kernels. Default on; set 0 for the untuned launch.
+    SGLANG_K3_ATTN_RES_TUNED_LAUNCH = EnvBool(True)
     # Radix-4 top-k for the K3 router on gfx942/gfx950. Preserves AITER's tie
     # and NaN semantics; falls back to the reference top-k elsewhere.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)

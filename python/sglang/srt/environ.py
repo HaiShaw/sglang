@@ -1470,12 +1470,23 @@ class Envs:
     # Master switch for the ROCm AITER K3 decode path: the MXFP4 SiTU MoE
     # runner, the fused MoE front and the AITER-backed attention projections.
     SGLANG_AITER_K3_OPT = EnvBool(False)
+    # Per-operator opt-ins for the gfx950 FlyDSL specializations. Each one
+    # fail-closes to the split GEMM chain when the chip, shape or AITER build
+    # cannot service it, so enabling one on unsupported hardware is a no-op.
+    SGLANG_K3_AITER_MLA_GATE = EnvBool(False)
+    SGLANG_K3_AITER_KDA_GROUP64 = EnvBool(False)
+    # Extend the validated KDA group64 fusion from the single-token bucket to
+    # two tokens.
+    SGLANG_K3_AITER_B2_FUSIONS = EnvBool(False)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_K3_FLYDSL_SOURCE = EnvStr("auto")
     # Set to "aiter" to defer the KDA f_b projection into AITER's fused gfx950
     # decode kernel instead of running it as a separate GEMM.
     SGLANG_K3_KDA_FUSED_BACKEND = EnvStr("")
+    # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for the
+    # KDA group64 projection, so the per-bucket tuning can be A/B'd in place.
+    SGLANG_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

@@ -135,6 +135,8 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _is_hip and envs.SGLANG_AITER_K3_OPT.get()
+_aiter_mla_gate = _is_hip and envs.SGLANG_K3_AITER_MLA_GATE.get()
+_aiter_kda_group64 = _is_hip and envs.SGLANG_K3_AITER_KDA_GROUP64.get()
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
@@ -1651,6 +1653,8 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        self._kda_group64_weight = None
+        self._kda_group64_scale = None
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1681,6 +1685,31 @@ class KimiK3DeltaAttention(nn.Module):
             [self.f_a_proj, self.b_proj], pad_rows_to=8
         )
         self._bfa_fa_size, self._bfa_b_size = sizes
+
+    def _prepare_group64_projection(self) -> None:
+        if (
+            not _aiter_kda_group64
+            or not self.do_fuse_qkvbfg
+            or not self.use_full_rank_gate
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import kda_group64_aiter_hip
+
+        merged = torch.cat(
+            [
+                self.fused_qkvg_proj.weight,
+                self.b_proj.weight,
+                self.f_a_proj.weight,
+                self.f_a_proj.weight.new_zeros((4, self.hidden_size)),
+            ],
+            dim=0,
+        ).contiguous()
+        if tuple(merged.shape) != (6288, 7168):
+            return
+        weight, scale = kda_group64_aiter_hip.pack(merged)
+        self._kda_group64_weight = weight
+        self._kda_group64_scale = scale
+        kda_group64_aiter_hip.warmup(weight, scale)
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -1785,6 +1814,31 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
+            if (
+                defer_f_b
+                and self._kda_group64_weight is not None
+                and self._kda_group64_scale is not None
+            ):
+                from sglang.kernels.ops.kimi_k3 import (
+                    kda_group64_aiter_hip,
+                )
+
+                if kda_group64_aiter_hip.covered(
+                    hidden_states,
+                    self._kda_group64_weight,
+                    self._kda_group64_scale,
+                ):
+                    packed = kda_group64_aiter_hip.run(
+                        hidden_states,
+                        self._kda_group64_weight,
+                        self._kda_group64_scale,
+                    )
+                    mixed_qkv, g_proj_states, beta, f_a, _padding = torch.split(
+                        packed,
+                        [self.split_sizes[0], self.split_sizes[1], 12, 128, 4],
+                        dim=-1,
+                    )
+                    return mixed_qkv, beta, f_a, g_proj_states
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
@@ -2048,19 +2102,31 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # join across graph-segment boundaries.
                     torch.cuda.current_stream().wait_stream(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
-                    gate = (
-                        precomputed[0]
-                        if precomputed is not None
-                        else self.g_proj(gate_input)[0]
+                    from sglang.kernels.ops.kimi_k3 import (
+                        mla_gate_aiter_hip,
+                        mla_output_gate,
                     )
-                    from sglang.kernels.ops.kimi_k3 import mla_output_gate
 
-                    if mla_output_gate.covered(x, gate):
-                        # One kernel for x * sigmoid(gate); double rounding
-                        # matches the unfused pair bit-for-bit.
-                        x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
+                    if (
+                        precomputed is None
+                        and _aiter_mla_gate
+                        and mla_gate_aiter_hip.covered(
+                            gate_input, self.g_proj.weight, x
+                        )
+                    ):
+                        x = mla_gate_aiter_hip.run(gate_input, self.g_proj.weight, x)
                     else:
-                        x = x * torch.sigmoid(gate)
+                        gate = (
+                            precomputed[0]
+                            if precomputed is not None
+                            else self.g_proj(gate_input)[0]
+                        )
+                        if mla_output_gate.covered(x, gate):
+                            # One kernel for x * sigmoid(gate); double rounding
+                            # matches the unfused pair bit-for-bit.
+                            x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
+                        else:
+                            x = x * torch.sigmoid(gate)
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2147,7 +2213,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         so its memory cannot be reused while the alt stream still writes."""
         self._gate_precomputed = None
         if (
-            self._gate_alt_stream is not None
+            not _aiter_mla_gate
+            and self._gate_alt_stream is not None
             and get_is_capture_mode()
             # The attention-core break ends the segment between the alt-stream
             # event record and the o_proj-side wait, so under breakable capture
@@ -3181,6 +3248,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            if _aiter_mla_gate and isinstance(self_attn, KimiK3MLAAttention):
+                from sglang.kernels.ops.kimi_k3 import mla_gate_aiter_hip
+
+                mla_gate_aiter_hip.warmup(self_attn.g_proj.weight)
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
@@ -3221,6 +3292,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     bias.data = bias.data.to(_bias_dtype)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
+                layer.self_attn._prepare_group64_projection()
                 layer.self_attn._prepare_fused_decode()
 
         for layer in self.model.layers:

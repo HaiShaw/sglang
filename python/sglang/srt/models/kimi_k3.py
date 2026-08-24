@@ -137,6 +137,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _is_hip and envs.SGLANG_AITER_K3_OPT.get()
 _aiter_mla_gate = _is_hip and envs.SGLANG_K3_AITER_MLA_GATE.get()
 _aiter_kda_group64 = _is_hip and envs.SGLANG_K3_AITER_KDA_GROUP64.get()
+_aiter_moe_preroute_fp8 = _is_hip and envs.SGLANG_K3_AITER_MOE_PREROUTE_FP8.get()
+_aiter_latent_tail_fp8 = _is_hip and envs.SGLANG_K3_AITER_LATENT_TAIL_FP8.get()
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
@@ -559,6 +561,18 @@ class KimiK3MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        self._preroute_routed_weight = None
+        self._preroute_routed_scale = None
+        self._preroute_shared_weight = None
+        self._preroute_shared_scale = None
+        self._preroute_shared_interleaved_weight = None
+        self._preroute_shared_interleaved_scale = None
+        self._preroute_shared_down_weight = None
+        self._preroute_shared_down_scale = None
+        self._latent_tail_weight = None
+        self._latent_tail_scale = None
+        self._situ_beta = float(config.activation_situ_beta)
+        self._situ_linear_beta = float(config.activation_situ_linear_beta)
 
         # SBO (single batch overlap): the shared experts read a fixed slab of
         # weights the routed path never touches (bf16 — the checkpoint leaves
@@ -690,6 +704,87 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+
+    def _prepare_preroute_fp8(self) -> None:
+        if (
+            not _aiter_moe_preroute_fp8
+            or not self.use_latent_moe
+            or self.shared_experts is None
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import (
+            moe_preroute_aiter_hip,
+        )
+        from sglang.kernels.ops.kimi_k3.aiter_fusion import (
+            quantize_fp8_rows,
+        )
+
+        routed = self.routed_expert_down_proj.weight
+        shared = self.shared_experts.gate_up_proj.weight
+        shared_down = self.shared_experts.down_proj.weight
+        if (
+            tuple(routed.shape) != (3584, 7168)
+            or tuple(shared.shape) != (1536, 7168)
+            or tuple(shared_down.shape) != (7168, 768)
+            or tuple(self.gate.weight.shape) != (896, 7168)
+        ):
+            return
+        self._preroute_routed_weight, self._preroute_routed_scale = quantize_fp8_rows(
+            routed.contiguous()
+        )
+        self._preroute_shared_weight, self._preroute_shared_scale = quantize_fp8_rows(
+            shared.contiguous()
+        )
+        if moe_preroute_aiter_hip.cooperative_preactivated_enabled():
+            self._preroute_shared_interleaved_weight = (
+                self._preroute_shared_weight.view(2, 768, 7168)
+                .permute(1, 0, 2)
+                .contiguous()
+                .view(1536, 7168)
+            )
+            self._preroute_shared_interleaved_scale = (
+                self._preroute_shared_scale.view(2, 768).t().contiguous().view(1536)
+            )
+        (
+            self._preroute_shared_down_weight,
+            self._preroute_shared_down_scale,
+        ) = quantize_fp8_rows(shared_down.contiguous())
+        moe_preroute_aiter_hip.warmup(
+            self._preroute_routed_weight,
+            self._preroute_routed_scale,
+            self._preroute_shared_weight,
+            self._preroute_shared_scale,
+            self.gate.weight,
+            self._preroute_shared_down_weight,
+            self._preroute_shared_down_scale,
+            self._preroute_shared_interleaved_weight,
+            self._preroute_shared_interleaved_scale,
+            situ_beta=self._situ_beta,
+            situ_linear_beta=self._situ_linear_beta,
+        )
+
+    def _prepare_latent_tail_fp8(self) -> None:
+        if (
+            not _aiter_latent_tail_fp8
+            or not self.fuse_ar_norm
+            or self.routed_expert_up_proj is None
+            or self.routed_expert_norm is None
+        ):
+            return
+        from sglang.kernels.ops.kimi_k3 import latent_tail_aiter_hip
+
+        if tuple(self.routed_expert_up_proj.weight.shape) != (7168, 3584):
+            return
+        self._latent_tail_weight, self._latent_tail_scale = latent_tail_aiter_hip.pack(
+            self.routed_expert_up_proj.weight
+        )
+        norm_weight, epsilon = self._get_fused_norm_params()
+        latent_tail_aiter_hip.warmup(
+            norm_weight,
+            self._latent_tail_weight,
+            self._latent_tail_scale,
+            epsilon,
+        )
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1147,13 +1242,48 @@ class KimiK3MoE(nn.Module):
         finally:
             route_quant_handoff.clear()
 
-    def _forward_shared(self, gate_up, shared_output):
+    def _forward_shared(
+        self,
+        gate_up,
+        shared_output,
+        *,
+        preactivated: bool = False,
+    ):
         shared = self.shared_experts
         if TYPE_CHECKING:
             assert shared is not None and isinstance(
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        if preactivated:
+            _k3_bf16_gemm(
+                gate_up,
+                shared.down_proj.weight,
+                out=shared_output,
+            )
+            return
+        if (
+            self._preroute_shared_down_weight is not None
+            and self._preroute_shared_down_scale is not None
+        ):
+            from sglang.kernels.ops.kimi_k3 import (
+                moe_preroute_aiter_hip,
+            )
+
+            if moe_preroute_aiter_hip.shared_down_covered(
+                gate_up,
+                self._preroute_shared_down_weight,
+                self._preroute_shared_down_scale,
+            ):
+                moe_preroute_aiter_hip.run_shared_down(
+                    gate_up,
+                    self._preroute_shared_down_weight,
+                    self._preroute_shared_down_scale,
+                    situ_beta=self._situ_beta,
+                    situ_linear_beta=self._situ_linear_beta,
+                    out=shared_output,
+                )
+                return
         _k3_bf16_gemm(
             shared.act_fn(gate_up),
             shared.down_proj.weight,
@@ -1166,7 +1296,11 @@ class KimiK3MoE(nn.Module):
         return norm.weight, norm.variance_epsilon
 
     def _forward_fused(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch],
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight, then land both TP-partial sums in
@@ -1186,14 +1320,71 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        preroute = None
+        shared_is_preactivated = False
+        if (
+            num_tokens <= 4
+            and self._preroute_routed_weight is not None
+            and self._preroute_routed_scale is not None
+            and self._preroute_shared_weight is not None
+            and self._preroute_shared_scale is not None
+        ):
+            from sglang.kernels.ops.kimi_k3 import (
+                moe_preroute_aiter_hip,
+            )
+
+            if (
+                self._preroute_shared_interleaved_weight is not None
+                and self._preroute_shared_interleaved_scale is not None
+                and moe_preroute_aiter_hip.cooperative_preactivated_tri_covered(
+                    hidden_states,
+                    self._preroute_routed_weight,
+                    self._preroute_routed_scale,
+                    self._preroute_shared_interleaved_weight,
+                    self._preroute_shared_interleaved_scale,
+                    self.gate.weight,
+                )
+            ):
+                routed_input, gate_up, router_logits = (
+                    moe_preroute_aiter_hip.run_tri_cooperative_preactivated(
+                        hidden_states,
+                        self._preroute_routed_weight,
+                        self._preroute_routed_scale,
+                        self._preroute_shared_interleaved_weight,
+                        self._preroute_shared_interleaved_scale,
+                        self.gate.weight,
+                        situ_beta=self._situ_beta,
+                        situ_linear_beta=self._situ_linear_beta,
+                    )
+                )
+                shared_is_preactivated = True
+                preroute = True
+            elif moe_preroute_aiter_hip.tri_covered(
+                hidden_states,
+                self._preroute_routed_weight,
+                self._preroute_routed_scale,
+                self._preroute_shared_weight,
+                self._preroute_shared_scale,
+                self.gate.weight,
+            ):
+                routed_input, gate_up, router_logits = moe_preroute_aiter_hip.run_tri(
+                    hidden_states,
+                    self._preroute_routed_weight,
+                    self._preroute_routed_scale,
+                    self._preroute_shared_weight,
+                    self._preroute_shared_scale,
+                    self.gate.weight,
+                )
+                preroute = True
+        if preroute is None:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1218,12 +1409,20 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        use_latent_tail = (
+            num_tokens in (1, 2, 4)
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self._latent_tail_weight is not None
+            and self._latent_tail_scale is not None
+        )
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
                 self._defer_moe_finalize
                 and self.fuse_ar_norm
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
+                and not use_latent_tail
             )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1234,7 +1433,11 @@ class KimiK3MoE(nn.Module):
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
             with torch.cuda.stream(self.alt_stream):
-                self._forward_shared(gate_up, shared_output)
+                self._forward_shared(
+                    gate_up,
+                    shared_output,
+                    preactivated=shared_is_preactivated,
+                )
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
                 k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
@@ -1254,12 +1457,15 @@ class KimiK3MoE(nn.Module):
                     *self._get_fused_norm_params(),
                 )
             elif self.fuse_ar_norm:
-                fused_norm = True
-                k3_ar_fusion.all_reduce_norm(
-                    latent.view(-1, self.moe_hidden_size),
-                    *self._get_fused_norm_params(),
-                    num_tokens=num_tokens,
-                )
+                if use_latent_tail:
+                    k3_ar_fusion.all_reduce(latent)
+                else:
+                    fused_norm = True
+                    k3_ar_fusion.all_reduce_norm(
+                        latent.view(-1, self.moe_hidden_size),
+                        *self._get_fused_norm_params(),
+                        num_tokens=num_tokens,
+                    )
             else:
                 k3_ar_fusion.all_reduce(latent)
             # the gemm_ag tail wants the normed latent straight out of the
@@ -1276,9 +1482,13 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
+            self._forward_shared(
+                gate_up,
+                shared_output,
+                preactivated=shared_is_preactivated,
+            )
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            if self.fuse_ar_norm and k3_ar_fusion.enabled():
+            if self.fuse_ar_norm and k3_ar_fusion.enabled() and not use_latent_tail:
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
                     buf.view(-1, k3_ar_fusion.NORM_DIM),
@@ -1292,6 +1502,29 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if use_latent_tail and not fused_norm:
+            from sglang.kernels.ops.kimi_k3 import latent_tail_aiter_hip
+
+            norm_weight, epsilon = self._get_fused_norm_params()
+            if latent_tail_aiter_hip.covered(
+                latent,
+                shared_output,
+                norm_weight,
+                self._latent_tail_weight,
+                self._latent_tail_scale,
+                epsilon,
+                prefix_sum,
+            ):
+                out = latent_tail_aiter_hip.run(
+                    latent,
+                    shared_output,
+                    norm_weight,
+                    self._latent_tail_weight,
+                    self._latent_tail_scale,
+                    epsilon,
+                    prefix_sum,
+                )
+                return out
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)
@@ -1332,7 +1565,11 @@ class KimiK3MoE(nn.Module):
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_fused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+            )
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         if use_dp:
@@ -3279,6 +3516,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                layer.mlp._prepare_preroute_fp8()
+                layer.mlp._prepare_latent_tail_fp8()
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast

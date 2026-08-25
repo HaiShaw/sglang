@@ -2052,8 +2052,12 @@ class KimiK3DeltaAttention(nn.Module):
         if _is_npu:
             return
         # ROCm KDA in-proj fusion and the ModelOpt block-FP8 merge were built
-        # independently; the fused path builds plain views and never sets
-        # _bfa_f_b_w, so keep it off the block-FP8 checkpoints entirely.
+        # independently and cannot compose: the fused path merges raw weight
+        # views with no scale applied and drives them through a bare
+        # SimpleNamespace carrier, which a block-FP8 quant_method.apply()
+        # rejects outright (it has no weight_scale_inv). _may_fuse_kda_inproj()
+        # rejects quantized modules structurally; this flag stays as the second
+        # line of defence for an FP8_PB_WO b_proj.
         if (
             _is_hip
             and not self._bfa_uses_block_fp8
@@ -2103,12 +2107,22 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
             return False
-        weights = [
-            module.weight
-            for module in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)
-        ]
+        modules = (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)
+        # No dequantization happens anywhere on the fused path, so a quantized
+        # module must be rejected here rather than upstream: the caller's
+        # _bfa_uses_block_fp8 probe only resolves the algo for b_proj, and a
+        # checkpoint whose three in-proj weights are uniformly FP8 under any
+        # other algo name would otherwise slip through the dtype check below.
+        if any(
+            hasattr(module, "weight_scale_inv") or hasattr(module, "weight_scale")
+            for module in modules
+        ):
+            return False
+        weights = [module.weight for module in modules]
         if not all(
-            type(weight.data) is torch.Tensor and weight.dim() == 2
+            type(weight.data) is torch.Tensor
+            and weight.dim() == 2
+            and weight.dtype in (torch.bfloat16, torch.float16)
             for weight in weights
         ):
             return False

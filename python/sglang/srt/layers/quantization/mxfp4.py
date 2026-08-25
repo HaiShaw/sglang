@@ -151,6 +151,13 @@ _flashinfer_mxfp4_permute_indices_device_cache: dict[
 ] = {}
 
 
+def _unwrap_trtllm_moe_output(result):
+    """Upstream's FFI unwrap: the TRT-LLM-gen MoE op returns a 1-tuple."""
+    if isinstance(result, (tuple, list)):
+        return result[0]
+    return result
+
+
 def _aiter_situ_uses_gu_interleaved_weights() -> bool:
     """Match AITER's SiTU activation-mode precedence when choosing weight layout."""
     a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
@@ -1555,6 +1562,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.bfloat16,
                 x_quant.device,
             )
+            # Only a published slice carries the zero-copy pointer contract.
+            # The fallback below is a private allocation, so the FFI return
+            # stays authoritative there — as it does for every CUDA caller.
+            zero_copy_published = symm_output is not None
             if symm_output is None:
                 with use_symmetric_memory(
                     get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1641,12 +1652,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         )
                         return StandardCombineInput(hidden_states=result)
                     # The finalized kernel writes to its explicit output
-                    # argument. Do not propagate the FFI return tensor: some
-                    # SiTU runner versions return a distinct wrapper/allocation
-                    # even though symm_output contains the published result.
-                    # Returning the destination makes the pointer contract
-                    # explicit for K3's zero-copy latent buffer.
-                    return StandardCombineInput(hidden_states=symm_output)
+                    # argument. When the K3 fused front published that buffer,
+                    # return the destination: some SiTU runner versions hand
+                    # back a distinct wrapper/allocation even though
+                    # symm_output holds the published result, and propagating
+                    # it would silently break the zero-copy pointer contract.
+                    # With no published buffer — which includes every
+                    # CUDA/FlashInfer caller — keep upstream's unwrap.
+                    if zero_copy_published:
+                        return StandardCombineInput(hidden_states=symm_output)
+                    return StandardCombineInput(
+                        hidden_states=_unwrap_trtllm_moe_output(result)
+                    )
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
@@ -1654,7 +1671,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if bias_bf16 is None and correction_bias is not None:
                     bias_bf16 = correction_bias.to(torch.bfloat16)
                     layer._situ_routing_bias_bf16 = bias_bf16
-                trtllm_fp4_block_scale_moe(
+                situ_result = trtllm_fp4_block_scale_moe(
                     # router_logits is a row-strided slice of the K3 fused
                     # front GEMM output; the FFI reads it as dense.
                     routing_logits=router_logits.to(torch.bfloat16).contiguous(),
@@ -1692,7 +1709,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     output=symm_output,
                     enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
                 )
-                return StandardCombineInput(hidden_states=symm_output)
+                if zero_copy_published:
+                    return StandardCombineInput(hidden_states=symm_output)
+                return StandardCombineInput(
+                    hidden_states=_unwrap_trtllm_moe_output(situ_result)
+                )
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),

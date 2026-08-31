@@ -11,7 +11,7 @@ from sglang.srt.managers.io_struct import GetInternalStateReq
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import ServerArgs, compute_world_size
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_server_args(

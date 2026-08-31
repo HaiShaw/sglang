@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetInternalStateReq
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerInternalStateEnvVars(unittest.TestCase):

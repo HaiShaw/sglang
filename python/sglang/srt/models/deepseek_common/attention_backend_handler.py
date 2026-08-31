@@ -27,6 +27,7 @@ MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MHA_CHUNKED_KV: AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
     AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
 }
 
@@ -193,6 +194,19 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        # Plain MHA materializes every key of the sequence per layer and hands
+        # the whole thing to one fmha call. aiter's fmha indexes K/V with 32-bit
+        # byte offsets, and one sequence past ~699 k tokens overruns them --
+        # AITER_CHECK then calls std::abort(), taking every rank down with it.
+        # Past the chunk capacity, fold the prefix in one chunk at a time; this
+        # is the crossover the CUDA backends already use in _support_mha_one_shot.
+        sum_seq_lens = (
+            sum(forward_batch.seq_lens_cpu)
+            if forward_batch.seq_lens_cpu is not None
+            else 0
+        )
+        if sum_seq_lens > forward_batch.get_max_chunk_capacity():
+            return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA

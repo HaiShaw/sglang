@@ -269,6 +269,24 @@ class DeepseekMHARocmForwardMixin:
             positions, hidden_states, forward_batch, zero_allocator
         )
 
+    def forward_normal_chunked_kv_rocm_prepare(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        """Prepare for the chunked-prefix route: leave mha_one_shot unset.
+
+        The suffix attention runs over the in-hand extend tokens alone, so this
+        is the plain ROCm prepare -- assembling the whole sequence here is what
+        the chunked route exists to avoid. The chunk loop itself is the shared
+        forward_normal_chunked_kv_core.
+        """
+        return self.forward_normal_rocm_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
     def _concat_and_cast_mha_k_rocm(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,

@@ -2214,6 +2214,77 @@ class AiterAttnBackend(AttentionBackend):
             and layer.qk_head_dim == layer.v_head_dim
         )
 
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
+        """Hook forward_normal_chunked_kv_core probes once per forward.
+
+        Every tensor the chunk pass needs is already on ForwardBatch
+        (prefix_chunk_cu_seq_lens / _max_seq_lens / _kv_indices) and the chunk
+        attention reads them directly, so there is nothing to precompute.
+        """
+
+    def _forward_extend_prefix_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        """Attend one prefix chunk, returning (out, natural-log lse).
+
+        k/v cover a single chunk, never the whole sequence, which is what keeps
+        this path inside aiter fmha's 2^32-byte K/V extent.
+        """
+        idx = forward_batch.prefix_chunk_idx
+        output, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            self.forward_metadata.qo_indptr,
+            forward_batch.prefix_chunk_cu_seq_lens[idx],
+            self.forward_metadata.max_q_len,
+            forward_batch.prefix_chunk_max_seq_lens[idx],
+            softmax_scale=layer.scaling,
+            # Every key in a prefix chunk precedes every extend token.
+            causal=False,
+            return_lse=True,
+        )[:2]
+        # aiter returns [heads, tokens]; merge_state indexes [tokens, heads].
+        return output, lse.transpose(0, 1).contiguous()
+
+    def _forward_extend_suffix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        """Attend the extend tokens alone, returning (out, natural-log lse).
+
+        The chunked-prefix prepare does not assemble the sequence, so k/v hold
+        extend tokens only and both cu_seqlens are qo_indptr. Reusing the
+        with-prefix branch's key bounds here would run the kernel off the end of
+        the buffer.
+        """
+        qo_indptr = self.forward_metadata.qo_indptr
+        max_q_len = self.forward_metadata.max_q_len
+        output, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            qo_indptr,
+            qo_indptr,
+            max_q_len,
+            max_q_len,
+            softmax_scale=layer.scaling,
+            causal=True,
+            return_lse=True,
+        )[:2]
+        # aiter returns [heads, tokens]; merge_state indexes [tokens, heads].
+        return output, lse.transpose(0, 1).contiguous()
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2225,6 +2296,13 @@ class AiterAttnBackend(AttentionBackend):
         sinks=None,
     ):
         self.logits_soft_cap = layer.logit_cap
+
+        # Chunked-prefix pass: the model hands us one prefix chunk's k/v and
+        # expects (out, lse) back so it can fold the chunk into its running
+        # accumulator. save_kv_cache is False on this path, so returning before
+        # the write below is what the caller already asked for.
+        if forward_batch.attn_attend_prefix_cache:
+            return self._forward_extend_prefix_chunk(q, k, v, layer, forward_batch)
 
         cache_loc = (
             forward_batch.out_cache_loc
@@ -2337,6 +2415,12 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                # Chunked-prefix suffix pass. It asks for the LSE through the
+                # batch, the way flashattention_backend does, and its k/v hold
+                # extend tokens only -- so it must not fall into the branch
+                # below, which rebuilds the whole sequence from the cache.
+                if forward_batch.mha_return_lse:
+                    return self._forward_extend_suffix(q, k, v, layer)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(

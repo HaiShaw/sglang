@@ -77,7 +77,7 @@ class EPLBManager:
     def on_forward_pass_end(self, forward_batch=None):
         if (
             forward_batch is not None
-            and megamoe_prefill_only_recorder_enabled(self._server_args)
+            and megamoe_prefill_only_recorder_enabled()
             and not forward_batch.is_extend_in_batch
         ):
             return

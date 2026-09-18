@@ -1,8 +1,10 @@
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
 
+import sglang.srt.layers.moe.token_dispatcher.moriepv2 as adapter
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.moriepv2 import (
     MoriEPv2Dispatcher,
@@ -82,3 +84,36 @@ def test_fp4_override_and_invalid_override(monkeypatch):
     monkeypatch.setenv("SGLANG_MORI_EPV2_DISPATCH_DTYPE", "invalid")
     with pytest.raises(ValueError, match="must be bf16 or fp4"):
         dispatcher.set_quant_config({"weight_dtype": torch.bfloat16})
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("comm_stream", [False, True])
+def test_recv_capacity_api_compatibility(monkeypatch, dynamic, comm_stream):
+    op = SimpleNamespace(
+        cfg=SimpleNamespace(effective_max_recv=64),
+        dispatch=Mock(return_value=(None, None, None, None, None, object())),
+    )
+    if dynamic:
+        op.prepare_recv_cap = Mock()
+    monkeypatch.setattr(adapter, "init_mori_epv2_op", Mock(return_value=op))
+    monkeypatch.setattr(adapter, "get_int_env_var", lambda name, default: default)
+    monkeypatch.setattr(torch, "cuda", MagicMock())
+    dispatcher = Mock()
+    MoriEPv2Dispatcher._initialize_op(dispatcher)
+    if dynamic:
+        assert op.prepare_recv_cap.call_args_list == [call(32), call(64)]
+    dispatcher.op = op
+    dispatcher._select_recv_cap.return_value = 32
+    dispatcher._comm_stream = Mock() if comm_stream else None
+    dispatcher._dispatch_intermediate_state = (None,) * 5 + (Mock(),)
+    MoriEPv2Dispatcher.dispatch_b(dispatcher)
+    kwargs = {"return_routing": True}
+    if dynamic:
+        kwargs.update(recv_cap=32, clone_routing=False)
+    op.dispatch.assert_called_once_with(None, None, None, None, **kwargs)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

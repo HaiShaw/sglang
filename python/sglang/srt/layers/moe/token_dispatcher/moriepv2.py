@@ -50,9 +50,7 @@ def _resolve_tbo_geometry(
         "SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK": (
             dispatch_warp_num_per_block
         ),
-        "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK": (
-            combine_warp_num_per_block
-        ),
+        "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK": (combine_warp_num_per_block),
     }
     for env_name, value in values.items():
         if value <= 0:
@@ -155,9 +153,7 @@ def init_mori_epv2_op(
     instance_id: int = 0,
     max_total_recv_tokens: int = 0,
     dispatch_dtype: torch.dtype = torch.bfloat16,
-    geometry: _MoriEPv2TBOGeometry = _MoriEPv2TBOGeometry(
-        None, None, None, None
-    ),
+    geometry: _MoriEPv2TBOGeometry = _MoriEPv2TBOGeometry(None, None, None, None),
 ):
     from mori.ops.dispatch_combine_v2 import (
         EpDispatchCombineConfig,
@@ -191,9 +187,7 @@ def init_mori_epv2_op(
             torch.bfloat16 if dispatch_dtype != torch.bfloat16 else None
         ),
         scale_dim=(
-            hidden_size // MXFP4_BLOCK_SIZE
-            if dispatch_dtype != torch.bfloat16
-            else 0
+            hidden_size // MXFP4_BLOCK_SIZE if dispatch_dtype != torch.bfloat16 else 0
         ),
         scale_type_size=1 if dispatch_dtype != torch.bfloat16 else 0,
         combine_mode="gather",
@@ -324,10 +318,13 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             self.dispatch_dtype,
             self._geometry,
         )
+        prepare_recv_cap = getattr(self._op, "prepare_recv_cap", None)
+        if prepare_recv_cap is None:
+            return
         graph_cap_max = get_int_env_var("SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX", 8192)
         graph_cap = 32
         while graph_cap <= min(graph_cap_max, self._op.cfg.effective_max_recv):
-            self._op.prepare_recv_cap(graph_cap)
+            prepare_recv_cap(graph_cap)
             graph_cap *= 2
 
     @property
@@ -437,9 +434,7 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         scale = None
         if self.dispatch_dtype == torch.float4_e2m1fn_x2:
             if self._num_tokens:
-                hidden_states, scale = self.fp4_quant_func(
-                    hidden_states, shuffle=False
-                )
+                hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
             else:
                 hidden_states = torch.empty(
                     (0, self.hidden_size // 2),
@@ -471,15 +466,16 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         )
         del self._dispatch_intermediate_state
         recv_cap = self._select_recv_cap(self._dynamic_recv_cluster_rows)
+        kwargs = {"return_routing": True}
+        if hasattr(self.op, "prepare_recv_cap"):
+            kwargs.update(recv_cap=recv_cap, clone_routing=False)
         if self._comm_stream is None:
             result = self.op.dispatch(
                 hidden_states,
                 topk_weights,
                 scale,
                 topk_ids,
-                return_routing=True,
-                recv_cap=recv_cap,
-                clone_routing=False,
+                **kwargs,
             )
         else:
             compute_stream = torch.cuda.current_stream()
@@ -492,9 +488,7 @@ class MoriEPv2Dispatcher(BaseDispatcher):
                     topk_weights,
                     scale,
                     topk_ids,
-                    return_routing=True,
-                    recv_cap=recv_cap,
-                    clone_routing=False,
+                    **kwargs,
                 )
                 done_event = torch.cuda.Event(blocking=False, interprocess=False)
                 done_event.record(self._comm_stream)

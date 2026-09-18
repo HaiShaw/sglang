@@ -121,6 +121,9 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_gfx1250_supported = _is_hip and (
+    "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+)
 
 
 def _require_fp4_dtype():
@@ -137,6 +140,9 @@ if _use_aiter or _use_hip_int4:
         shuffle_scale,
         shuffle_weight,
     )
+
+    if _is_gfx1250_supported:
+        from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1478,20 +1484,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
                 is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale_2d = scale.reshape(-1, scale.shape[-1])
-                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
+                if _is_gfx1250_supported:
+                    scale.data = moe_shuffle_scale(
+                        scale.contiguous(),
+                        experts_cnt=num_experts,
+                        is_guinterleave=gu_intv,
+                        gate_up=is_w13_scale,
+                    )
+                else:
+                    scale_2d = scale.reshape(-1, scale.shape[-1])
+                    scale.data = shuffle_scale(
+                        scale_2d, num_experts, gu_intv, is_w13_scale
+                    )
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-            is_shuffled = _is_shuffle_moe_mxfp4
+            is_shuffled = _is_shuffle_moe_mxfp4 or _is_gfx1250_supported
             if is_shuffled:
-                layer.w13_weight.data = shuffle_weight(
+                weight_shuffle = (
+                    moe_shuffle_weight if _is_gfx1250_supported else shuffle_weight
+                )
+                layer.w13_weight.data = weight_shuffle(
                     layer.w13_weight,
                     is_guinterleave=gu_intv,
                     gate_up=True,
                 )
-                layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.data = weight_shuffle(
                     layer.w2_weight,
                     is_guinterleave=gu_intv,
                     gate_up=False,

@@ -234,6 +234,8 @@ def decode(
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
     kv_splits: int | None = None,
+    compress_ratio: int | None = None,
+    q_len: int | None = None,
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_decode(
         q,
@@ -243,6 +245,8 @@ def decode(
         attn_sink,
         softmax_scale,
         kv_splits=kv_splits,
+        compress_ratio=compress_ratio,
+        q_len=q_len,
     )
 
 

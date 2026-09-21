@@ -62,6 +62,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
+from . import flydsl_decode_hook
+
 _is_gfx1250_supported = is_gfx1250_supported()
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
@@ -580,6 +582,8 @@ def _paged_decode_reduce_kernel(
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    FOLD_Q_LEN: tl.constexpr,
+    FOLD_WIN: tl.constexpr,
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -635,8 +639,39 @@ def _paged_decode_reduce_kernel(
             mask=d_mask,
         )
         return
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
+    # FOLD_Q_LEN > 0: stage-1 planned its splits from the whole verify
+    # window's longest token (it folds the window into the MFMA M dimension),
+    # so the plan here has to be derived from the same length or the two
+    # disagree about which splits hold data. Computed from kv_indptr in-kernel
+    # -- fabricating a rounded-up indptr on the host measured 36 us per call.
+    if FOLD_Q_LEN > 0:
+        base = (t // FOLD_Q_LEN) * FOLD_Q_LEN
+        for i in tl.static_range(FOLD_Q_LEN):
+            nxt = tl.load(kv_indptr_ptr + base + i + 1) - tl.load(
+                kv_indptr_ptr + base + i
+            )
+            kv_len = tl.maximum(kv_len, nxt)
+    if FOLD_WIN > 0:
+        # Two-phase stage-1: the tile axis is the shared committed tail followed
+        # by the union of the window's sliding segments, not one span of kv_len,
+        # so the segment count has to be derived from the same tile total or the
+        # two sides disagree about which splits hold data -- and with partial
+        # buffers reused across layers that is a stale read, not a lost term.
+        base = (t // FOLD_Q_LEN) * FOLD_Q_LEN
+        len_0 = tl.load(kv_indptr_ptr + base + 1) - tl.load(kv_indptr_ptr + base)
+        len_last = tl.load(kv_indptr_ptr + base + FOLD_Q_LEN) - tl.load(
+            kv_indptr_ptr + base + FOLD_Q_LEN - 1
+        )
+        win_0 = tl.minimum(len_0, FOLD_WIN)
+        tail_last = len_last - tl.minimum(len_last, FOLD_WIN)
+        num_tiles = tl.cdiv(tail_last, BLOCK_K) + tl.cdiv(
+            win_0 + FOLD_Q_LEN - 1, BLOCK_K
+        )
+        tiles_per_segment = tl.cdiv(num_tiles, KV_SPLITS)
+        act_num_segments = tl.cdiv(num_tiles, tl.maximum(tiles_per_segment, 1))
+    else:
+        tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+        act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
     segm_mask = k_offs < act_num_segments
 
     # 1D loads for (m, l) along splits — single head h.
@@ -709,6 +744,8 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
+    compress_ratio: int | None = None,
+    q_len: int | None = None,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
@@ -844,45 +881,69 @@ def _sparse_attn_v4_paged_decode_triton(
         (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
     )
 
-    grid_split = (T, n_head_blocks, kv_splits)
-    _paged_decode_split_kernel[grid_split](
-        q,
-        unified_kv,
-        kv_scales_arg,
-        kv_indices,
-        kv_indptr,
-        m_partial,
-        l_partial,
-        acc_partial,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        unified_kv.stride(0),
-        unified_kv.stride(1),
-        ks_stride_n_arg,
-        m_partial.stride(0),
-        m_partial.stride(1),
-        m_partial.stride(2),
-        l_partial.stride(0),
-        l_partial.stride(1),
-        l_partial.stride(2),
-        acc_partial.stride(0),
-        acc_partial.stride(1),
-        acc_partial.stride(2),
-        acc_partial.stride(3),
-        H,
-        D,
-        kv_splits,
-        qk_scale,
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        QUANT_KV=quant_kv,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups_arg,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    # Env-gated FlyDSL stage-1 (SGLANG_MLA_FLYDSL=1). It fills the same
+    # partials; see flydsl_decode_hook.py for the three contract
+    # differences it has to bridge (index layout, BLOCK_K, segmentation).
+    fold_q_len = 0
+    fold_win = 0
+    if flydsl_decode_hook.eligible(
+        q, unified_kv, H, D, T, kv_splits, quant_kv, compress_ratio, q_len
+    ):
+        fold_q_len, fold_win = flydsl_decode_hook.run_split(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            m_partial,
+            l_partial,
+            acc_partial,
+            H,
+            D,
+            T,
+            kv_splits,
+            qk_scale,
+        )
+        block_k = flydsl_decode_hook.BLOCK_K
+    else:
+        grid_split = (T, n_head_blocks, kv_splits)
+        _paged_decode_split_kernel[grid_split](
+            q,
+            unified_kv,
+            kv_scales_arg,
+            kv_indices,
+            kv_indptr,
+            m_partial,
+            l_partial,
+            acc_partial,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            ks_stride_n_arg,
+            m_partial.stride(0),
+            m_partial.stride(1),
+            m_partial.stride(2),
+            l_partial.stride(0),
+            l_partial.stride(1),
+            l_partial.stride(2),
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_partial.stride(3),
+            H,
+            D,
+            kv_splits,
+            qk_scale,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=block_k,
+            QUANT_KV=quant_kv,
+            GROUP_SIZE=_FP8_GROUP_SIZE,
+            NUM_GROUPS=num_groups_arg,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
 
     # 2D-tile reduce: grid = (T, H, ceil(D/D_CHUNK)). One CTA per
     # (token, single-head, D-chunk). Adaptive D_CHUNK based on whether the
@@ -930,8 +991,42 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_D=block_d,
         D_CHUNK=d_chunk,
         BLOCK_K=block_k,
+        FOLD_Q_LEN=fold_q_len,
+        FOLD_WIN=fold_win,
         num_warps=4,
     )
+
+    # SGLANG_MLA_FLYDSL_AUDIT=1: same real inputs, both stage-1 paths, compare
+    # the MERGED output -- the partials are not comparable because the two
+    # sides segment KV differently. Outside capture only, and only when the
+    # hook actually ran, so the recursion below always takes the Triton side.
+    if fold_q_len and flydsl_decode_hook.audit_on():
+        flydsl_decode_hook.audit(
+            out,
+            lambda: _sparse_attn_v4_paged_decode_triton(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                kv_scales=kv_scales,
+                kv_splits=kv_splits,
+                compress_ratio=None,  # forces the fallback
+                q_len=q_len,
+            ),
+            ctx={
+                "q": q,
+                "unified_kv_shape": tuple(unified_kv.shape),
+                "kv_indices": kv_indices,
+                "kv_indptr": kv_indptr,
+                "attn_sink": attn_sink,
+                "softmax_scale": softmax_scale,
+                "kv_splits": kv_splits,
+                "q_len": q_len,
+                "block_k": block_k,
+            },
+        )
     return out
 
 
@@ -944,6 +1039,8 @@ def sparse_attn_v4_paged_decode(
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
     kv_splits: int | None = None,
+    compress_ratio: int | None = None,
+    q_len: int | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -978,4 +1075,6 @@ def sparse_attn_v4_paged_decode(
             softmax_scale,
             kv_scales=kv_scales,
             kv_splits=kv_splits,
+            compress_ratio=compress_ratio,
+            q_len=q_len,
         )

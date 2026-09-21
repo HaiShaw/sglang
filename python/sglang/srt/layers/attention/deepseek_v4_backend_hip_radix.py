@@ -1715,6 +1715,18 @@ class DeepseekV4HipRadixBackend(
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
                 kv_splits=_kv_splits_for_stream(compress_ratio),
+                # The FlyDSL stage-1 needs it too: its q-folding assumes each
+                # draft token's index slice is a prefix of the window's last,
+                # which only the ragged stream satisfies.
+                compress_ratio=compress_ratio,
+                # And the real verify-window width, which is NOT a constant:
+                # a DSpark draft worker verifies gamma rows (6), the target
+                # worker gamma+1 (7), and a plain decode step carries one
+                # token per request. The hook cannot infer it from T -- at
+                # 6 tokens/request it divides by 7 whenever the batch size
+                # happens to be a multiple of 7, and silently regroups the
+                # batch.
+                q_len=(self.target_verify_num_draft_tokens if verify_as_decode else 1),
             )
 
         # prefill / extend

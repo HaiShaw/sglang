@@ -21,6 +21,7 @@ from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_hip import mxfp8_consumes_fp8
 from sglang.srt.layers.quantization.fp8_utils import resolve_block_fp8_mxfp8_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -59,32 +60,24 @@ def fused_rmsnorm_fake_quant_eligible(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Whether rmsnorm_fake_quant_fp8 applies: gfx950 with a 32-wide-block checkpoint
-    (V4.1), whose dense route takes the norm output already on the fp8 grid as an
-    Fp8GridActivation."""
+    (V4.1), whose native or aiter dense route takes the norm output already on the fp8
+    grid (Fp8GridActivation) or as fp8 + ue8m0 (Mxfp8Activation)."""
     if not (_is_hip and _is_gfx95_supported and isinstance(quant_config, Fp8Config)):
         return False
     block = quant_config.weight_block_size
+    backend = resolve_block_fp8_mxfp8_backend()
     return (
         block is not None
         and block[1] == 32
         and quant_config.scale_fmt == "ue8m0"
-        and resolve_block_fp8_mxfp8_backend().is_gfx95_mxfp8_native()
+        and (backend.is_gfx95_mxfp8_native() or backend.is_gfx95_aiter_group32())
     )
 
 
 def _native_mxfp8_consumer(linear: Optional[nn.Module]) -> bool:
-    """Whether linear runs the gfx950 native MXFP8 route, which consumes fp8 + ue8m0
-    scales directly at every M."""
-    if linear is None:
-        return False
-    quant_method = linear.quant_method
-    return (
-        isinstance(quant_method, Fp8LinearMethod)
-        and quant_method.block_fp8_as_mxfp8
-        and linear.block_fp8_mxfp8_ready
-        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
-        and linear.mxfp8_native_ready
-    )
+    """Whether linear runs a gfx950 route (native MXFP8 or aiter group32) that consumes
+    fp8 + ue8m0 scales directly at every M."""
+    return linear is not None and mxfp8_consumes_fp8(linear)
 
 
 def _fake_quant_applies(norm: nn.Module, x: torch.Tensor) -> bool:

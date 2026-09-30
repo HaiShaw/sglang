@@ -22,6 +22,18 @@ _NUM_WARPS, _NUM_STAGES, _WAVES_PER_EU, _MFMA_NONKDIM = 2, 2, 2, 16
 _CACHE_MODIFIER = ".cg"
 # 8 splits of 256-wide K steps fill the machine up to this many rows
 _SPLIT_K, _SPLIT_K_BLOCK_K, _SPLIT_K_MAX_M = 8, 256, 64
+# Single-launch tile (BLOCK_M, BLOCK_N, BLOCK_K, num_warps) by row count: every row tile re-reads its weight
+# columns, so more rows take taller tiles. BLOCK_N stays a 32 multiple for the epilogue.
+_TILE_BY_MAX_M = (
+    (64, (_BLOCK_M, _BLOCK_N, _BLOCK_K, _NUM_WARPS)),
+    (128, (64, 32, 256, 4)),
+    (256, (64, 64, 256, 4)),
+    (None, (64, 64, 128, 4)),
+)
+
+
+def _tile_config(T: int):
+    return next(tile for max_m, tile in _TILE_BY_MAX_M if max_m is None or T <= max_m)
 
 
 @triton.jit
@@ -382,7 +394,8 @@ def batched_gemm_bf16_fp8_grid(
         assert _split_k_applies(T, D, R), (T, D, R)
         _batched_gemm_split_k(x, w, out, fp8_grid, scale)
         return result
-    grid = (G, triton.cdiv(T, _BLOCK_M) * triton.cdiv(R, _BLOCK_N))
+    block_m, block_n, block_k, num_warps = _tile_config(T)
+    grid = (G, triton.cdiv(T, block_m) * triton.cdiv(R, block_n))
     _batched_gemm_bf16_fp8_grid_kernel[grid](
         x,
         w,
@@ -402,14 +415,14 @@ def batched_gemm_bf16_fp8_grid(
         scale if scale is not None else out,
         R // 32,
         G * R // 32,
-        BLOCK_SIZE_M=_BLOCK_M,
-        BLOCK_SIZE_N=_BLOCK_N,
-        BLOCK_SIZE_K=_BLOCK_K,
-        EVEN_K=(D % _BLOCK_K == 0),
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        EVEN_K=(D % block_k == 0),
         FP8_GRID=fp8_grid,
         EMIT_FP8=emit_fp8,
         cache_modifier=_CACHE_MODIFIER,
-        num_warps=_NUM_WARPS,
+        num_warps=num_warps,
         num_stages=_NUM_STAGES,
         waves_per_eu=_WAVES_PER_EU,
         matrix_instr_nonkdim=_MFMA_NONKDIM,

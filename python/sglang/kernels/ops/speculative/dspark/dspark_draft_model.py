@@ -481,6 +481,15 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
     if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
         return False
+    backend = getattr(quant_method, "mxfp8_dense_backend", None)
+    if (
+        getattr(quant_method, "block_fp8_as_mxfp8", False)
+        and backend is not None
+        and backend.is_gfx95_aiter_group32()
+    ):
+        # the gfx950 aiter group32 route keeps a plain [N, K] weight but serves it per linear from
+        # its compact ue8m0 scales; the stacked block-fp8 GEMM would take a CUDA-only quant
+        return False
     block_out = quant_method.quant_config.weight_block_size[0]
     # the gfx950 native MXFP8 route keeps the weight in a 3-D lane-order layout
     return all(

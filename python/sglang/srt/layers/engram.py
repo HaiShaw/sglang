@@ -548,6 +548,17 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+def _host_device_pointer(host_ptr: int) -> int:
+    """Device address of cudaHostRegister'ed memory (not always == host_ptr on ROCm)."""
+    lib = ctypes.CDLL("libamdhip64.so" if _is_hip else "libcudart.so")
+    fn = lib.hipHostGetDevicePointer if _is_hip else lib.cudaHostGetDevicePointer
+    dev = ctypes.c_void_p()
+    err = fn(ctypes.byref(dev), ctypes.c_void_p(host_ptr), 0)
+    if err != 0 or not dev.value:
+        raise RuntimeError(f"HostGetDevicePointer(0x{host_ptr:x}) failed: {err}")
+    return dev.value
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -596,6 +607,8 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        # Kernels must use the device alias: on ROCm it can differ from the host VA.
+        self.dev_ptr = _host_device_pointer(self.bytes.data_ptr())
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -719,6 +732,12 @@ class EngramEmbedding(nn.Module):
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
 
+    def _gather_ptrs(self) -> Tuple[int, int]:
+        if self.host_table is not None:
+            base = self.host_table.dev_ptr
+            return base, base + self.weight.numel()
+        return self.weight.data_ptr(), self.scale.data_ptr()
+
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
@@ -749,8 +768,7 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             out = self._empty(indices)
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                *self._gather_ptrs(),
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
@@ -809,8 +827,7 @@ class EngramEmbedding(nn.Module):
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            *self._gather_ptrs(),
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,

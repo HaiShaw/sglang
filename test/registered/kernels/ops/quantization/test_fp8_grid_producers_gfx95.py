@@ -168,7 +168,7 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         from sglang.kernels.ops.gemm import gfx95_batched_gemm_bf16_fp8_grid as mod
 
         only_16_row_tile = ((None, mod._TILE_BY_MAX_M[0][1]),)
-        for g, r, d in GEMM_SHAPES + [(4, 1024, 4096)]:
+        for g, r, d in [(G, R, D), (4, 1024, 4096)]:
             torch.manual_seed(11)
             w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
             for t in (65, 128, 129, 256, 257, 384):
@@ -178,9 +178,9 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
                     dict(fp8_grid=True),
                     dict(fp8_grid=False, emit_fp8=True),
                 ]
-                outs = [self.gemm(x, w, split_k=False, **kw) for kw in kwargs]
+                outs = [batched_gemm_bf16_fp8_grid(x, w, split_k=False, **kw) for kw in kwargs]
                 with mock.patch.object(mod, "_TILE_BY_MAX_M", only_16_row_tile):
-                    refs = [self.gemm(x, w, split_k=False, **kw) for kw in kwargs]
+                    refs = [batched_gemm_bf16_fp8_grid(x, w, split_k=False, **kw) for kw in kwargs]
                 for kw, out, ref in zip(kwargs, outs, refs):
                     if isinstance(out, tuple):
                         self.assertTrue(

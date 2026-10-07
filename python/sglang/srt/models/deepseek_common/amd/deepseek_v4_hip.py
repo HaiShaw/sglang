@@ -230,21 +230,38 @@ def forward_layer_fused_boundary(
     )
     # The boundary speaks its own (hidden_states, prev_pre, pending_post) triple;
     # the loop speaks HcState. This is the only place the two meet.
-    from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
+    from sglang.srt.models.deepseek_v4_mhc import HcPending, HcPendingBoundary, HcState
 
     pending = isinstance(state.streams, HcPending)
+    if isinstance(state.streams, HcPendingBoundary):
+        pending_in = state.streams
+    elif pending:
+        pending_in = tuple(state.streams)
+    else:
+        pending_in = None
     hidden_states, prev_pre, pending_post = forward_hc_pre_from_prev_fused_boundary(
         model.layers[i],
         positions=positions,
-        hidden_states=None if pending else state.streams,
+        hidden_states=None if pending_in is not None else state.streams,
         input_ids=input_ids,
         forward_batch=forward_batch,
         input_ids_global=input_ids_global,
         prev_pre=state.pre,
-        pending_post=tuple(state.streams) if pending else None,
+        pending_post=pending_in,
         defer_post=defer_post,
+        # the next layer's attention boundary rides in this layer's MoE all-reduce
+        next_boundary_fn=(
+            model.layers[nxt].hc_attn_fn
+            if defer_post
+            and nxt != getattr(model, "late_layer_start", None)
+            and envs.SGLANG_ROCM_MHC_ALL_REDUCE_STATS.get()
+            else None
+        ),
     )
-    return HcState(
-        hidden_states if pending_post is None else HcPending(*pending_post),
-        prev_pre,
-    )
+    if pending_post is None:
+        streams = hidden_states
+    elif isinstance(pending_post, HcPendingBoundary):
+        streams = pending_post
+    else:
+        streams = HcPending(*pending_post)
+    return HcState(streams, prev_pre)

@@ -19,6 +19,7 @@ register_amd_ci(est_time=60, stage="stage-c", runner_config="large-8-gpu-amd-mi3
 WORLD_SIZE = 4
 HIDDEN = 5120
 HC = 4
+MIX = (2 + HC) * HC
 
 
 def _get_open_port() -> int:
@@ -48,6 +49,11 @@ def _run(rank: int, port: int) -> None:
 
     from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
         all_reduce_mhc_post,
+        all_reduce_mhc_post_stats,
+    )
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        HcCoefficients,
+        hc_boundary_fused_deferred,
     )
 
     device = torch.device(f"cuda:{rank}")
@@ -61,7 +67,7 @@ def _run(rank: int, port: int) -> None:
     communicator = CustomAllreduce(dist.group.WORLD, device)
     try:
         assert not communicator.disabled
-        for rows in (1, 3, 8):
+        for rows in (1, 3, 8, 12, 24):
             generator = torch.Generator(device=device).manual_seed(rows)
             inputs = [
                 torch.randn(rows, HIDDEN, generator=generator, device=device).bfloat16()
@@ -90,6 +96,30 @@ def _run(rank: int, port: int) -> None:
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(graph_out, expected, rtol=0, atol=0)
+
+            # the stats variant: same residual, the Triton boundary's y bitwise, and
+            # coefficients equal up to the fp32 summation order of the partials
+            pre = torch.rand(rows, HC, generator=generator, device=device)
+            hc_fn = torch.randn(MIX, HC * HIDDEN, generator=generator, device=device)
+            hc_scale = torch.rand(3, generator=generator, device=device) + 0.5
+            hc_base = torch.randn(MIX, generator=generator, device=device) * 0.1
+            hc_args = dict(k=HC * HIDDEN, rms_eps=1e-6, mix=MIX, hc_mult=HC)
+            hc_args.update(sinkhorn_iters=20, hc_eps=1e-6)
+            out, y, part_mix, part_sq = all_reduce_mhc_post_stats(
+                inputs[rank], residual, post, comb, pre, hc_fn * 0.02, communicator
+            )
+            _, y_ref, ref = hc_boundary_fused_deferred(
+                None, expected, None, None, pre, hc_fn * 0.02, hc_scale, hc_base,
+                HC, 20, 1e-6, 1e-6,
+            )
+            fused = HcCoefficients(
+                part_mix, part_sq, hc_scale, hc_base,
+                num_slices=part_sq.shape[0], **hc_args,
+            )
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            torch.testing.assert_close(y, y_ref, rtol=0, atol=0)
+            for got, want in zip(fused.tensors(), ref.tensors()):
+                torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
             dist.barrier()
     finally:
         communicator.close()

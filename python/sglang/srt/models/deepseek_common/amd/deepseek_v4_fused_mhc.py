@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
 import triton
@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.models.deepseek_v4_mhc import AttnOutput
+from sglang.srt.models.deepseek_v4_mhc import AttnOutput, HcPendingBoundary
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -31,8 +31,10 @@ _is_gfx1250_supported = is_gfx1250_supported()
 if _is_hip:
     from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
         all_reduce_mhc_post,
+        all_reduce_mhc_post_stats,
     )
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        HcCoefficients,
         hc_boundary_fused_deferred,
     )
 if _is_gfx95_supported:
@@ -56,6 +58,15 @@ class MhcPostOperands(NamedTuple):
 # the fused all-reduce + hc_post kernel: DeepSeek-V4.1's hidden size, up to this many rows
 MHC_HIDDEN_SIZE = 5120
 ALL_REDUCE_MHC_MAX_ROWS = 8
+# the boundary-stats variant beats the unfused all-reduce + boundary up to 12 rows (gfx950 TP4
+# microbench); past ~16 rows its one-stage all-reduce reads 4x the bytes of AITER's two-stage one
+ALL_REDUCE_MHC_STATS_MAX_ROWS = 12
+
+
+def all_reduce_mhc_max_rows() -> int:
+    if envs.SGLANG_ROCM_MHC_ALL_REDUCE_STATS.get():
+        return ALL_REDUCE_MHC_STATS_MAX_ROWS
+    return ALL_REDUCE_MHC_MAX_ROWS
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -503,7 +514,7 @@ def hc_boundary(
 def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
     return (
         _is_gfx95_supported
-        and 1 <= residual.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
+        and 1 <= residual.shape[0] <= all_reduce_mhc_max_rows()
         and residual.shape[1:] == (4, MHC_HIDDEN_SIZE)
         and residual.dtype == torch.bfloat16
         and residual.is_contiguous()
@@ -557,19 +568,64 @@ def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
     return _make_mhc_fusion(residual, coefficients, get_parallel().tp_group.ca_comm)
 
 
-def apply_attention_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
-    """Attention's all-reduce fused with hc_post; returns the rebuilt streams."""
-    return all_reduce_mhc_post(
-        x, state.residual, state.post, state.comb, get_parallel().attn_tp_group.ca_comm
+def _boundary_coefficients(
+    layer, part_mix: torch.Tensor, part_sq: torch.Tensor, hc_scale, hc_base
+) -> "HcCoefficients":
+    # hc_boundary_fused_deferred's coefficients over partials the all-reduce wrote
+    return HcCoefficients(
+        part_mix,
+        part_sq,
+        hc_scale,
+        hc_base,
+        k=layer.hc_mult * MHC_HIDDEN_SIZE,
+        rms_eps=layer.rms_norm_eps,
+        mix=part_mix.shape[2],
+        hc_mult=layer.hc_mult,
+        num_slices=part_sq.shape[0],
+        sinkhorn_iters=layer.hc_sinkhorn_iters,
+        hc_eps=layer.hc_eps,
     )
 
 
-def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
+def _all_reduce_mhc(
+    x: torch.Tensor,
+    state: MhcPostOperands,
+    comm,
+    pre: torch.Tensor,
+    boundary_fn: Optional[torch.Tensor],
+) -> Union[torch.Tensor, HcPendingBoundary]:
+    # with boundary_fn the next boundary's collapse (by pre) and mixing partials ride along
+    if boundary_fn is None:
+        return all_reduce_mhc_post(x, state.residual, state.post, state.comb, comm)
+    return HcPendingBoundary(
+        *all_reduce_mhc_post_stats(
+            x, state.residual, state.post, state.comb, pre, boundary_fn, comm
+        )
+    )
+
+
+def apply_attention_mhc(
+    x: torch.Tensor,
+    state: MhcPostOperands,
+    pre: Optional[torch.Tensor] = None,
+    boundary_fn: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, HcPendingBoundary]:
+    """Attention's all-reduce fused with hc_post; returns the rebuilt streams, or
+    with boundary_fn also the FFN boundary's collapse and partials."""
+    return _all_reduce_mhc(
+        x, state, get_parallel().attn_tp_group.ca_comm, pre, boundary_fn
+    )
+
+
+def apply_moe_mhc(
+    x: torch.Tensor,
+    state: MhcPostOperands,
+    pre: Optional[torch.Tensor] = None,
+    boundary_fn: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, HcPendingBoundary]:
     """The same for the MoE's post-experts reduce, on rows it merged but left
     unreduced."""
-    return all_reduce_mhc_post(
-        x, state.residual, state.post, state.comb, get_parallel().tp_group.ca_comm
-    )
+    return _all_reduce_mhc(x, state, get_parallel().tp_group.ca_comm, pre, boundary_fn)
 
 
 def forward_hc_pre_from_prev_fused_boundary(
@@ -580,22 +636,37 @@ def forward_hc_pre_from_prev_fused_boundary(
     forward_batch,
     input_ids_global: torch.Tensor,
     prev_pre: Optional[torch.Tensor],
-    pending_post: Optional[Tuple[torch.Tensor, ...]],
+    pending_post: Union[None, Tuple[torch.Tensor, ...], HcPendingBoundary],
     defer_post: bool,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
+    next_boundary_fn: Optional[torch.Tensor] = None,
+) -> Tuple[
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Union[None, Tuple[torch.Tensor, ...], HcPendingBoundary],
+]:
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
     comb); with defer_post this layer's is returned the same way and hidden_states is None."""
-    if pending_post is None:
-        pending_post = (None, hidden_states, None, None)
-    residual, x, attn_coefficients = hc_boundary(
-        layer,
-        *pending_post,
-        prev_pre,
-        layer.hc_attn_fn,
-        layer.hc_attn_scale,
-        layer.hc_attn_base,
-    )
+    if isinstance(pending_post, HcPendingBoundary):
+        residual, x = pending_post.residual, pending_post.y
+        attn_coefficients = _boundary_coefficients(
+            layer,
+            pending_post.part_mix,
+            pending_post.part_sq,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+        )
+    else:
+        if pending_post is None:
+            pending_post = (None, hidden_states, None, None)
+        residual, x, attn_coefficients = hc_boundary(
+            layer,
+            *pending_post,
+            prev_pre,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+        )
     # the boundary's reduce + sinkhorn rides in the norm launch
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
@@ -613,19 +684,32 @@ def forward_hc_pre_from_prev_fused_boundary(
         # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
         # fail loud rather than fall back to an unfused reduce.
         assert isinstance(x, AttnOutput)
-        residual = apply_attention_mhc(x.partial, mhc)
+        fused = apply_attention_mhc(
+            x.partial,
+            mhc,
+            attn_coefficients.pre,
+            layer.hc_ffn_fn if envs.SGLANG_ROCM_MHC_ALL_REDUCE_STATS.get() else None,
+        )
         x = None
-    residual, x, ffn_coefficients = hc_boundary(
-        layer,
-        x,
-        residual,
-        attn_coefficients.post if x is not None else None,
-        attn_coefficients.comb if x is not None else None,
-        attn_coefficients.pre,
-        layer.hc_ffn_fn,
-        layer.hc_ffn_scale,
-        layer.hc_ffn_base,
-    )
+    if mhc is not None and isinstance(fused, HcPendingBoundary):
+        residual, x = fused.residual, fused.y
+        ffn_coefficients = _boundary_coefficients(
+            layer, fused.part_mix, fused.part_sq, layer.hc_ffn_scale, layer.hc_ffn_base
+        )
+    else:
+        if mhc is not None:
+            residual = fused
+        residual, x, ffn_coefficients = hc_boundary(
+            layer,
+            x,
+            residual,
+            attn_coefficients.post if x is not None else None,
+            attn_coefficients.comb if x is not None else None,
+            attn_coefficients.pre,
+            layer.hc_ffn_fn,
+            layer.hc_ffn_scale,
+            layer.hc_ffn_base,
+        )
     x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
     mhc = moe_mhc_fusion(layer, residual, ffn_coefficients, forward_batch)
     x = layer._run_moe_ffn_dp_sync(
@@ -643,7 +727,10 @@ def forward_hc_pre_from_prev_fused_boundary(
         assert isinstance(x, MoEOutput)
         # Reduction already applied post. The next boundary consumes this
         # materialized residual, including when it would normally defer post.
-        return apply_moe_mhc(x.get_merged(), mhc), ffn_pre, None
+        fused = apply_moe_mhc(x.get_merged(), mhc, ffn_pre, next_boundary_fn)
+        if isinstance(fused, HcPendingBoundary):
+            return None, ffn_pre, fused
+        return fused, ffn_pre, None
     if defer_post:
         return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
     return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None

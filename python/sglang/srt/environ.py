@@ -903,6 +903,9 @@ class Envs:
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
     SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    # gfx950 DeepSeek-V4.1 TP4 decode (<= 12 rows): the fused all-reduce + hc_post also takes the next
+    # mHC boundary's collapse and mixing statistics, one launch fewer per sublayer.
+    SGLANG_ROCM_MHC_ALL_REDUCE_STATS = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone

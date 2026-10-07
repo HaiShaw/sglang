@@ -118,6 +118,16 @@ class HcPending(NamedTuple):
     comb: torch.Tensor
 
 
+class HcPendingBoundary(NamedTuple):
+    """Out of the HIP fused boundary: a post the all-reduce already ran, plus the next
+    boundary's collapse and mixing partials it took on the way (all_reduce_mhc_post_stats)."""
+
+    residual: torch.Tensor
+    y: torch.Tensor
+    part_mix: torch.Tensor
+    part_sq: torch.Tensor
+
+
 class HcState(msgspec.Struct):
     """The mHC state of the stream between two hyper-connections.
 
@@ -126,7 +136,7 @@ class HcState(msgspec.Struct):
     `release` must empty a consumed state in every frame that still binds it.
     """
 
-    streams: Union[torch.Tensor, HcPending, None]
+    streams: Union[torch.Tensor, HcPending, HcPendingBoundary, None]
     pre: Optional[torch.Tensor] = None
     input: Optional[HcPreOutput] = None
 
@@ -147,6 +157,8 @@ class HcState(msgspec.Struct):
 
     def materialized(self, cfg: HcConfig) -> HcState:
         """Run the outstanding post, if any; residual readers call this first."""
+        if isinstance(self.streams, HcPendingBoundary):
+            return HcState(self.streams.residual, self.pre)
         if not isinstance(self.streams, HcPending):
             return self
         p = self.streams
@@ -163,6 +175,9 @@ class HcState(msgspec.Struct):
         assert self.streams is not None
         if isinstance(self.streams, HcPending):
             return HcState(HcPending(*(rows(t) for t in self.streams)), pre)
+        if isinstance(self.streams, HcPendingBoundary):
+            # the partials are [slices, M, MIX]: drop them, the next boundary recomputes
+            return HcState(rows(self.streams.residual), pre)
         else:
             return HcState(rows(self.streams), pre)
 

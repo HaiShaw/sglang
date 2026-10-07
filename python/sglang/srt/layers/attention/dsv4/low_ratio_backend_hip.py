@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
+    index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
     logits_rows_per_chunk,
@@ -72,13 +73,13 @@ def _indexer_inputs(layer, x, q_lora, pos):
     indexer = layer.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    if (
-        _gemv_head_weight_rows(indexer, x)
-        and indexer.n_heads % 16 == 0
+    fused_q = (
+        indexer.n_heads % 16 == 0
         and indexer.n_heads <= 64
         and indexer.index_head_dim == 128
         and layer.freqs_cis.dtype == torch.complex64
-    ):
+    )
+    if fused_q and _gemv_head_weight_rows(indexer, x):
         # decode rows: wq_b, split-K head-weight GEMV, then one launch for RoPE, fp4 pack and reduce
         q, _ = indexer.wq_b(q_lora)
         partials = rocm_router_gemv_split_k(x, indexer.weights_proj.weight)
@@ -91,6 +92,20 @@ def _indexer_inputs(layer, x, q_lora, pos):
             indexer.head_weight_scale,
             num_heads=indexer.n_heads,
         )
+    if fused_q:
+        # prefill rows: wq_b, then one launch for RoPE, fp4 fake-quant and pack
+        q, _ = indexer.wq_b(q_lora)
+        q_fp4, q_scale = index_q_rope_pack_flydsl(
+            q,
+            layer.freqs_cis,
+            pos,
+            indexer.rope_head_dim,
+            num_heads=indexer.n_heads,
+            # 2 warps keep the codegen of the separate launches, so the codes stay bitwise equal
+            num_warps=2,
+        )
+        weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled
+        return q_fp4, q_scale, weights
     # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
     q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
     q_fp4, q_scale = pack_fp4_query_flydsl(q)

@@ -817,6 +817,104 @@ def _index_q_pack_weights_kernel(
         )
 
 
+@triton.jit
+def _index_q_rope_pack_kernel(
+    q_ptr,  # [T, H * 128] bf16 (wq_b output)
+    f_ptr,  # [max_pos, RD // 2, 2] fp32: the real view of the complex freqs table
+    pos_ptr,  # [T] int64
+    q_fp4_ptr,  # [T, H, 64] int8
+    q_scale_ptr,  # [T, 1, 4, 16, 4] uint8
+    stride_qt,
+    num_pos,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+):
+    """Grid (T, H // HEADS_PER_PROGRAM): the query part of _index_q_pack_weights_kernel, row for row,
+    with one program walking HEADS_PER_PROGRAM heads of a token; a program per head row is
+    launch-bound at prefill row counts."""
+    t = tl.program_id(0)
+    h0 = tl.program_id(1) * HEADS_PER_PROGRAM
+    pos = tl.load(pos_ptr + t)
+    # the caller owns positions < num_pos; an out-of-range row reads entry 0 instead of past the table
+    pos = tl.where((pos >= 0) & (pos < num_pos), pos, 0)
+    c = tl.arange(0, 4)
+    for i in tl.static_range(HEADS_PER_PROGRAM):
+        h = h0 + i
+        fq = rope_tail_fake_quant_fp4_row(
+            q_ptr + t.to(tl.int64) * stride_qt + h * D,
+            f_ptr + pos * RD,
+            D=D,
+            RD=RD,
+            BLK=32,
+            AMAX_FLOOR=AMAX_FLOOR,
+            INVERSE=False,
+            COMPRESSED_KV=False,
+        )
+        # the standalone path stores the fake-quant as bf16 and the packer reloads it
+        values = fq.to(tl.bfloat16).to(tl.float32)
+        v0, v1 = tl.split(tl.reshape(values, (D // 2, 2)))
+        packed, packed_sf = quantize_fp4_indexer_row(
+            values, v0, v1, BLOCK_N=D, GROUP_N=32, RNE=True
+        )
+        row = t.to(tl.int64) * H + h
+        tl.store(q_fp4_ptr + row * (D // 2) + tl.arange(0, D // 2), packed)
+        # scale bytes: chunk c of head h at [t, 0, c, h % 16, h // 16]
+        sf_bytes = ((packed_sf >> (8 * c)) & 0xFF).to(tl.uint8)
+        base = q_scale_ptr + t.to(tl.int64) * (4 * 16 * 4) + c * (16 * 4) + (h % 16) * 4
+        tl.store(base + h // 16, sf_bytes)
+        if h < 16:
+            # groups this head count does not have stay zero
+            for g in tl.static_range(H // 16, 4):
+                tl.store(base + g, tl.zeros((4,), dtype=tl.uint8))
+
+
+def index_q_rope_pack_flydsl(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    *,
+    num_heads: int,
+    heads_per_program: int = 8,
+    num_warps: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(q_fp4 [T, H, 64] int8, q_scale [T, 1, 4, 16, 4] uint8) in one launch, bitwise
+    pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128), freqs_cis[positions], rope_dim))."""
+    T = q.shape[0]
+    H = num_heads
+    assert q.dtype == torch.bfloat16 and q.dim() == 2 and q.shape[1] == H * 128
+    assert q.stride(1) == 1
+    assert H % 16 == 0 and 0 < H <= 64, H
+    assert H % heads_per_program == 0, (H, heads_per_program)
+    assert freqs_cis.dtype == torch.complex64 and freqs_cis.shape[1] == rope_dim // 2
+    assert positions.shape == (T,)
+    f_real = torch.view_as_real(freqs_cis)
+    assert f_real.is_contiguous()
+    q_fp4 = torch.empty((T, H, 64), dtype=torch.int8, device=q.device)
+    q_scale = torch.empty((T, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    if T == 0:
+        return q_fp4, q_scale
+    _index_q_rope_pack_kernel[(T, H // heads_per_program)](
+        q,
+        f_real,
+        positions,
+        q_fp4,
+        q_scale,
+        q.stride(0),
+        f_real.shape[0],
+        H=H,
+        D=128,
+        RD=rope_dim,
+        AMAX_FLOOR=FP4_AMAX_FLOOR,
+        HEADS_PER_PROGRAM=heads_per_program,
+        num_warps=num_warps,
+    )
+    return q_fp4, q_scale
+
+
 def index_q_rope_pack_weights_flydsl(
     q: torch.Tensor,
     freqs_cis: torch.Tensor,

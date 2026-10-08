@@ -478,6 +478,11 @@ def _apply_wo_a_bf16_matmul(
         )
         and _hip.wo_a_split_k_allowed()
     )
+    if emit_fp8 and hip_decode_verify:
+        # gfx950: wo_b's MXFP8 route takes fp8 + ue8m0 straight from the split-K reduce
+        y = _hip.wo_a_split_k_mxfp8(o, wo_a)
+        if y is not None:
+            return y
     if (
         (
             fast_path

@@ -10,6 +10,10 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.gemm.dsv4_wo_a import (
+    wo_a_split_k_mxfp8 as _wo_a_split_k_mxfp8,
+    wo_a_split_k_mxfp8_supported,
+)
 from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
@@ -232,6 +236,14 @@ def wo_b_emits_mxfp8(attn, num_tokens: int) -> bool:
     if consumer is None:
         consumer = attn._wo_b_mxfp8_consumer = _mxfp8_consumer(attn.wo_b)
     return consumer
+
+
+def wo_a_split_k_mxfp8(o: torch.Tensor, wo_a: torch.Tensor) -> Optional[Mxfp8Activation]:
+    """o [T, G, D] @ wo_a [G, R, D]^T with wo_b's MXFP8 quant fused into the split-K reduce,
+    as an Mxfp8Activation [T, G * R]; None outside the kernel's shapes and row range."""
+    if not wo_a_split_k_mxfp8_supported(o, wo_a):
+        return None
+    return Mxfp8Activation(*_wo_a_split_k_mxfp8(o, wo_a))
 
 
 def wo_a_fp8_grid_matmul(

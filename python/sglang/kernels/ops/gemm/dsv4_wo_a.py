@@ -135,3 +135,110 @@ def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
         x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
     )
     return _quantize_partial(partial)
+
+
+
+# Split-K WO-A for any (G, R, D) with wo_b's MXFP8 quant in the reduce (gfx950 MXFP8 routes).
+_SPLIT_K = 8
+_SPLIT_K_BN, _SPLIT_K_BK = 64, 128
+# Rows of one tile: while every row fits one tile the weight is read once; past that the
+# bf16 bmm + quant wins (gfx950, G 1/2/4 x 1024 x 4096). BM 32 measured slower than 64.
+WO_A_SPLIT_K_MAX_ROWS = 64
+
+
+@triton.jit
+def _wo_a_split_k_partial(
+    X,
+    W,
+    P,
+    M,
+    SX,
+    G: tl.constexpr,
+    R: tl.constexpr,
+    D: tl.constexpr,
+    K_STEPS: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BM: tl.constexpr,
+):
+    # axis 2 packs (row tile, K split): Triton grids have three axes
+    tile, group = tl.program_id(0), tl.program_id(1)
+    split, mt = tl.program_id(2) % SPLITS, tl.program_id(2) // SPLITS
+    m = mt * BM + tl.arange(0, BM)
+    n = tile * 64 + tl.arange(0, 64)
+    k = split * (K_STEPS * 128) + tl.arange(0, 128)
+    acc = tl.zeros((BM, 64), tl.float32)
+    for i in range(K_STEPS):
+        offsets = k + i * 128
+        x = tl.load(
+            X + m[:, None] * SX + group * D + offsets[None, :], m[:, None] < M, 0
+        )
+        w = tl.load(W + (group * R + n[None, :]) * D + offsets[:, None])
+        acc += tl.dot(x, w)
+    tl.store(
+        P + ((split * M + m[:, None]) * G + group) * R + n[None, :],
+        acc,
+        m[:, None] < M,
+    )
+
+
+@triton.jit
+def _wo_a_split_k_reduce_quant(P, Q, S, M, GR: tl.constexpr, SPLITS: tl.constexpr):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    i = tile * 256 + tl.arange(0, 256)
+    split = tl.arange(0, SPLITS)
+    v = tl.load(P + split[:, None] * (M * GR) + row * GR + i[None, :])
+    y = tl.sum(v, 0).to(tl.bfloat16).to(tl.float32).reshape((8, 32))
+    amax = tl.max(tl.abs(y), 1)
+    sf, inv = ue8m0_scale(amax)
+    quant = tl.minimum(tl.maximum(y * inv[:, None], -448.0), 448.0).to(tl.float8e4nv)
+    tl.store(Q + row * GR + i, quant.reshape((256,)))
+    tl.store(S + row * (GR // 32) + tile * 8 + tl.arange(0, 8), sf.to(tl.uint8))
+
+
+def wo_a_split_k_mxfp8_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether wo_a_split_k_mxfp8 tiles x [M, G, D] @ weight [G, R, D]^T."""
+    if x.ndim != 3 or weight.ndim != 3:
+        return False
+    g, r, d = weight.shape
+    return (
+        x.dtype == weight.dtype == torch.bfloat16
+        and 1 <= x.shape[0] <= WO_A_SPLIT_K_MAX_ROWS
+        and x.shape[1:] == (g, d)
+        and x.stride(2) == 1
+        and x.stride(1) == d
+        and weight.is_contiguous()
+        and r % _SPLIT_K_BN == 0
+        and d % (_SPLIT_K * _SPLIT_K_BK) == 0
+        and (g * r) % 256 == 0
+    )
+
+
+def wo_a_split_k_mxfp8(x: torch.Tensor, weight: torch.Tensor):
+    """einsum('tgd,grd->tgr') rounded to BF16 and MXFP8-quantized in the split-K reduce:
+    fp8 e4m3 [M, G * R] and row-major ue8m0 scales [M, G * R / 32]. At G = 2, R = 1024,
+    D = 4096 and M <= 8 this is bitwise wo_a_bf16_small_batch + mxfp8_e4m3_quantize."""
+    m = x.shape[0]
+    g, r, d = weight.shape
+    bm = 16 if m <= 16 else WO_A_SPLIT_K_MAX_ROWS
+    partial = torch.empty((_SPLIT_K, m, g, r), dtype=torch.float32, device=x.device)
+    _wo_a_split_k_partial[(r // _SPLIT_K_BN, g, _SPLIT_K * triton.cdiv(m, bm))](
+        x,
+        weight,
+        partial,
+        m,
+        x.stride(0),
+        g,
+        r,
+        d,
+        d // (_SPLIT_K * _SPLIT_K_BK),
+        _SPLIT_K,
+        bm,
+        num_warps=4,
+        num_stages=3,
+    )
+    q = torch.empty((m, g * r), device=x.device, dtype=torch.float8_e4m3fn)
+    s = torch.empty((m, g * r // 32), device=x.device, dtype=torch.uint8)
+    _wo_a_split_k_reduce_quant[(m, g * r // 256)](
+        partial, q, s, m, g * r, _SPLIT_K, num_warps=4
+    )
+    return q, s

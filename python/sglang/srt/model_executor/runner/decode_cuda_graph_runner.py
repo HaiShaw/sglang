@@ -259,7 +259,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
+        from sglang.srt.layers.moe.utils import is_tbo_prefill_only
+
+        self.enable_two_batch_overlap = (
+            get_exec().overlap.enable_two_batch_overlap and not is_tbo_prefill_only()
+        )
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph

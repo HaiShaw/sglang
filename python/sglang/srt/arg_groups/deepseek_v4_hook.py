@@ -273,7 +273,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 or cfg.enable_decoder_swa_bounded_replay
             ),
         ),
-        ("two-batch overlap", cfg.enable_two_batch_overlap),
+        (
+            "two-batch overlap outside ROCm DP attention + TP MoE",
+            cfg.enable_two_batch_overlap
+            and not (
+                is_gfx95_supported()
+                and attn_dp_enabled_of(cfg)
+                and cfg.moe_a2a_backend == "none"
+            ),
+        ),
         ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:

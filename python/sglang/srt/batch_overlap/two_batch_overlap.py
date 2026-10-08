@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     PplxDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.utils import is_tbo_prefill_only
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -345,7 +346,7 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        if not is_tbo_enabled() or is_tbo_prefill_only():
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -444,6 +445,12 @@ class TboDPAttentionPreparer:
                 and enable_a2a_moe
                 and (resolved_deepep_mode.is_low_latency())
             )
+            if (
+                is_tbo_prefill_only()
+                and not local_batch.forward_mode.is_extend_without_speculative()
+            ):
+                self.local_tbo_split_seq_index = None
+                local_can_run_tbo = False
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -749,6 +756,9 @@ class TboForwardBatchPreparer:
                 f"{key=} {old_value=} {num_seqs=} {batch=}"
             )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
+            if key == "extend_start_loc":
+                # Row offsets into the child's own token slice.
+                output_dict[key] = output_dict[key] - start_token_index
 
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(
@@ -851,6 +861,8 @@ class TboForwardBatchPreparer:
                 next_token_logits_buffer=None,
                 # The aux packer runs in the parent model forward, not per child.
                 aux_hidden_states_buffer=None,
+                # The Engram hasher runs once on the parent batch.
+                engram_history=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.

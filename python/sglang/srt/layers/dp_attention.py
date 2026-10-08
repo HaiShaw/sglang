@@ -1145,6 +1145,15 @@ def _tbo_event(key) -> torch.cuda.Event:
     return ev
 
 
+def tbo_comm_wait_compute(comm, compute, event_key) -> None:
+    """comm.wait_stream(compute) through a persistent event: wait_stream
+    records a fresh event per call, which exhausts the HSA signal pool over a
+    long TBO serving run (HSA_STATUS_ERROR_OUT_OF_RESOURCES)."""
+    ev = _tbo_event(("ready", event_key))
+    ev.record(compute)
+    comm.wait_event(ev)
+
+
 def dp_gather_partial_async(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -1162,7 +1171,8 @@ def dp_gather_partial_async(
     global_tokens.record_stream(comm)
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
-        comm.wait_stream(compute)  # inputs were produced on the compute stream
+        # inputs were produced on the compute stream
+        tbo_comm_wait_compute(comm, compute, event_key)
         dp_gather_partial(global_tokens, local_tokens, forward_batch)
         ev.record(comm)
     return ev
@@ -1206,7 +1216,7 @@ def dp_reduce_scatterv_async(
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
-        comm.wait_stream(compute)
+        tbo_comm_wait_compute(comm, compute, event_key)
         get_parallel().tp_group.reduce_scatterv(
             global_tokens, output=output_local, sizes=sizes
         )

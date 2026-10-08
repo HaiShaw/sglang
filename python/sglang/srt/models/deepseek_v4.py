@@ -96,6 +96,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
     set_dp_buffer_len_from_batch,
+    tbo_comm_wait_compute,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -3741,7 +3742,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         comm = get_dp_tbo_comm_stream()
         compute = torch.cuda.current_stream()
         with torch.cuda.stream(comm):
-            comm.wait_stream(compute)
+            tbo_comm_wait_compute(comm, compute, ("gather", sub))
             dp_gather_partial(global_hidden, local, fb)
             state.gather_event = _tbo_event(("gather", sub))
             state.gather_event.record(comm)
@@ -3801,6 +3802,257 @@ class DeepseekV4DecoderLayer(nn.Module):
             n = hidden.shape[0]
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
+
+    # V4.1 prefill TBO (HIP fused mHC boundary, DP attention + TP MoE). Each
+    # ubatch carries prev_pre and the unapplied FFN hc_post across layers, like
+    # forward_hc_pre_from_prev_fused_boundary; the MoE runs as op_gather_a ..
+    # op_combine_b between these two ops.
+    def op_v41_tbo_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+        pending_post: Optional[Tuple[torch.Tensor, ...]],
+        hash_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
+        tbo_subbatch_index: int,
+        **kwargs,
+    ):
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+            _gfx95_dense_post_attention_norm,
+            hc_boundary,
+        )
+
+        if self.engram is not None:
+            assert pending_post is None, "the Engram gate reads the residual stream"
+            before_engram = hidden_states
+            hidden_states = self.engram(
+                hidden_states,
+                hash_ids[:, self.engram.layer_hash_index],
+                forward_batch,
+            )
+            if self.config.vision_n_layers > 0:
+                hidden_states = torch.where(
+                    (input_ids == self.config.image_token_id)[:, None, None],
+                    before_engram,
+                    hidden_states,
+                )
+        if pending_post is None:
+            pending_post = (None, hidden_states, None, None)
+        residual, x, attn_coefficients = hc_boundary(
+            self,
+            *pending_post,
+            prev_pre,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+        )
+        x, x_quant = self._input_norm(
+            x, allow_aiter_quant=False, coefficients=attn_coefficients
+        )
+        if forward_batch.batch_size == 0:
+            # TboAttnBackend leaves a request-less ubatch's metadata unplanned,
+            # so its attention would read the previous step's; its padded rows
+            # only feed the MoE collectives.
+            x = torch.zeros_like(x)
+        else:
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                x = self.self_attn(
+                    x=x,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=x_quant,
+                )
+        residual, x, ffn_coefficients = hc_boundary(
+            self,
+            x,
+            residual,
+            attn_coefficients.post,
+            attn_coefficients.comb,
+            attn_coefficients.pre,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+        )
+        x = _gfx95_dense_post_attention_norm(self, x, ffn_coefficients)
+        _mask_dp_pad_rows(x, forward_batch)
+        state.hidden_states_mlp_input = x
+        state.v41_residual = residual
+        state.v41_ffn_coefficients = ffn_coefficients
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+                v41_hash_ids=hash_ids,
+                v41_input_ids=input_ids,
+            )
+        )
+
+    def op_v41_tbo_post(self, state):
+        x = state.pop("hidden_states_mlp_output")
+        residual = state.pop("v41_residual")
+        ffn_pre, ffn_post, ffn_comb = state.pop("v41_ffn_coefficients").tensors()
+        if self._v41_tbo_defer_post:
+            hidden_states, pending_post = None, (x, residual, ffn_post, ffn_comb)
+        else:
+            hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+            pending_post = None
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            forward_batch=state.forward_batch,
+            prev_pre=ffn_pre,
+            pending_post=pending_post,
+            hash_ids=state.v41_hash_ids,
+            input_ids=state.v41_input_ids,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+                "v41_hash_ids",
+                "v41_input_ids",
+            }
+        )
+        return output
+
+
+def _tbo_prepare_dp_children(forward_batch: ForwardBatch, device) -> None:
+    """Non-EP DP TP-MoE: the per-ubatch DP gather/combine (op_gather/op_combine)
+    needs each ubatch's per-rank token counts, but tbo_padded_len is computed
+    per-rank locally (not synced). All-gather both ubatches' padded lengths once
+    across DP ranks, then populate each child's global_num_tokens +
+    global_dp_buffer_len so the gatherv/reduce_scatterv buffers size correctly."""
+    tp_group = get_parallel().tp_group
+    world = tp_group.world_size
+    children = forward_batch.tbo_children
+    local_lens = torch.tensor(
+        [int(c.tbo_padded_len) for c in children], dtype=torch.int64, device=device
+    )
+    gathered = torch.empty(
+        (world, local_lens.shape[0]), dtype=torch.int64, device=device
+    )
+    tp_group.all_gather_into_tensor(gathered, local_lens)
+    gathered_cpu = gathered.tolist()
+    rank = tp_group.rank_in_group
+    for idx, child in enumerate(children):
+        sizes = [gathered_cpu[r][idx] for r in range(world)]
+        child.global_num_tokens_cpu = sizes
+        child.global_num_tokens_gpu = gathered[:, idx].contiguous()
+        child.global_num_tokens_padded_cpu = sizes
+        child.global_dp_buffer_len = sum(sizes)
+        child.dp_padding_mode = DpPaddingMode.SUM_LEN
+        child.dp_local_start_pos = child.dp_local_num_tokens = None
+        # Gather the ubatch's input_ids -> global ONCE here (cached on the
+        # child) instead of per-layer in op_gather_a. The hash MoE reads
+        # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
+        # VARYING size (-> RCCL registers a new internal buffer per size ->
+        # HSA_STATUS_ERROR_OUT_OF_RESOURCES) collapses to 1 per ubatch.
+        local_ids = child.input_ids
+        rows = sizes[rank]
+        if local_ids.shape[0] < rows:
+            padded_ids = local_ids.new_zeros((rows,))
+            padded_ids[: local_ids.shape[0]] = local_ids
+        elif local_ids.shape[0] > rows:
+            padded_ids = local_ids[:rows]
+        else:
+            padded_ids = local_ids
+        gids = torch.empty(
+            (sum(sizes),), dtype=local_ids.dtype, device=local_ids.device
+        )
+        tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
+        child._tbo_global_input_ids = gids
+
+
+def _tbo_hand_back_attn_state(forward_batch: ForwardBatch) -> None:
+    """The layers after the TBO span run on the primary backend, but the span's
+    candidate-source publication and the last index source's sparse rows were
+    written to the child backends. Copy both back to the primary."""
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+    backend = get_attn_backend()
+    # An idle DP rank keeps the previous step's metadata and has no late reader.
+    if not isinstance(backend, TboAttnBackend) or forward_batch.batch_size == 0:
+        return
+    primary = backend.primary
+    children = forward_batch.tbo_children
+    child_backends = [b for b, c in zip(backend.children, children) if c.batch_size > 0]
+    child_batches = [c for c in children if c.batch_size > 0]
+
+    parent_core = primary.forward_metadata.core_metadata
+    for child, cb in zip(child_batches, child_backends):
+        start, end = child.tbo_parent_token_range
+        child_core = cb.forward_metadata.core_metadata
+        for ratio in parent_core.low_ratios:
+            for get in (
+                "sparse_page_indices",
+                "sparse_topk_lengths",
+                "sparse_raw_indices",
+            ):
+                dst = getattr(parent_core, get)(ratio)
+                src = getattr(child_core, get)(ratio)
+                if dst is not None and src is not None:
+                    dst[start:end].copy_(src[: end - start])
+
+    if not hasattr(primary, "candidate_masks"):
+        return
+    merged = []
+    for child, cb in zip(child_batches, child_backends):
+        masks = cb.candidate_masks
+        if not isinstance(masks, list) or len(masks) != child.batch_size:
+            masks = [None] * child.batch_size
+        if merged and len(merged) + len(masks) == forward_batch.batch_size + 1:
+            # a two-chunk split: the last request of the first ubatch continues here
+            req = len(merged) - 1
+            merged.append(_tbo_join_candidates(merged.pop(), masks[0], req))
+            masks = masks[1:]
+        merged.extend(masks)
+    assert len(merged) == forward_batch.batch_size, (
+        len(merged),
+        forward_batch.batch_size,
+    )
+    primary.candidate_masks = merged
+
+
+def _tbo_join_candidates(head, rest, req: int):
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+        cat_candidate_blocks,
+    )
+
+    if head is None and rest is None:
+        return None
+    if head is not None and rest is not None:
+        return cat_candidate_blocks([head, rest])
+    # The head half is an identity request (no publication). Under bounded replay
+    # the late consumers read only the tail rows, which must lie in the second half.
+    assert head is None, "a published head with an identity continuation"
+    tail = get_attn_backend().tail_forward_metadata
+    tail = None if tail is None else tail.late_layer_tail
+    assert (
+        tail is not None and int(tail.extend_seq_lens_cpu[req]) <= rest.ids.shape[0]
+    ), "a late candidate consumer would read identity rows of a split request"
+    return rest
+
+
+def _tbo_pad_rows(x: Optional[torch.Tensor], rows: int) -> Optional[torch.Tensor]:
+    if x is None or x.shape[0] == rows:
+        return x
+    out = x.new_zeros((rows, *x.shape[1:]))
+    out[: x.shape[0]] = x
+    return out
+
+
+def _tbo_merge_rows(children, values, original_len: int) -> torch.Tensor:
+    out = values[0].new_zeros((original_len, *values[0].shape[1:]))
+    for child, value in zip(children, values):
+        start, end = child.tbo_parent_token_range
+        out[start:end] = value[: end - start]
+    return out
 
 
 def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
@@ -4001,6 +4253,11 @@ class DeepseekV4Model(nn.Module):
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
+        from sglang.srt.layers.moe.utils import is_tbo_enabled, set_tbo_prefill_only
+
+        if is_tbo_enabled():
+            # The DSV4 operations strategy covers prefill only.
+            set_tbo_prefill_only()
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
@@ -4090,6 +4347,7 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        run_tbo: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
@@ -4147,8 +4405,21 @@ class DeepseekV4Model(nn.Module):
         # gate excludes Engram/DSpark-capture layers and the model end.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
-        for i in range(self.start_layer, self.end_layer):
+        first_layer = self.start_layer
+        if run_tbo:
+            first_layer = self._v41_tbo_end()
+            hidden_states, prev_pre = self._forward_layers_tbo_v41(
+                positions,
+                hidden_states,
+                forward_batch,
+                input_ids,
+                hash_ids,
+                first_layer,
+            )
+            state = mhc.HcState(hidden_states, prev_pre)
+        else:
+            state = mhc.HcState(hidden_states)
+        for i in range(first_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4242,6 +4513,8 @@ class DeepseekV4Model(nn.Module):
             or not get_moe_a2a_backend().is_none()
             or get_parallel().attn_dp_size > 1
         )
+        if self.hc_pre_from_prev_sublayer:
+            path_ok = path_ok and self._v41_tbo_end() is not None
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
@@ -4252,6 +4525,95 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.global_forward_mode.is_extend_without_speculative()
             and path_ok
             and self.pp_group.world_size == 1
+        )
+
+    def _v41_tbo_end(self) -> Optional[int]:
+        """First layer after the V4.1 TBO span, or None if V4.1 TBO cannot run.
+        The span stops before the late-layer tail (its row selection and DP
+        resize run on the merged batch) and before any DSpark capture layer."""
+        if not (
+            _is_hip
+            and get_moe_a2a_backend().is_none()
+            and get_parallel().attn_dp_size > 1
+        ):
+            return None
+        end = (
+            self.late_layer_start
+            if self.late_layer_start is not None
+            else self.end_layer
+        )
+        if self.dspark_layers_to_capture is not None:
+            end = min([end, *self.dspark_layers_to_capture])
+        if end <= self.start_layer or not all(
+            self.layers[i].hc_boundary_fused for i in range(self.start_layer, end)
+        ):
+            return None
+        return end
+
+    def _forward_layers_tbo_v41(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        hash_ids: Optional[torch.Tensor],
+        end: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.batch_overlap.operations import (
+            YieldOperation,
+            execute_overlapped_operations,
+        )
+
+        children = forward_batch.tbo_children
+        _tbo_prepare_dp_children(forward_batch, hidden_states.device)
+        operations = []
+        for i in range(self.start_layer, end):
+            layer = self.layers[i]
+            layer._v41_tbo_defer_post = (
+                i + 1 < end and self.layers[i + 1].engram is None
+            )
+            operations += [
+                layer.op_v41_tbo_attn,
+                layer.op_gather_a,
+                YieldOperation(),
+                layer.op_gather_b,
+                layer.op_moe,
+                layer.op_combine_a,
+                YieldOperation(),
+                layer.op_combine_b,
+                layer.op_v41_tbo_post,
+            ]
+        inputs_arr = []
+        for idx, child in enumerate(children):
+            rows = slice(*child.tbo_parent_token_range)
+            padded = int(child.tbo_padded_len)
+            inputs_arr.append(
+                dict(
+                    positions=_tbo_pad_rows(positions[rows], padded),
+                    hidden_states=_tbo_pad_rows(hidden_states[rows], padded),
+                    forward_batch=child,
+                    prev_pre=None,
+                    pending_post=None,
+                    hash_ids=(
+                        None
+                        if hash_ids is None
+                        else _tbo_pad_rows(hash_ids[rows], padded)
+                    ),
+                    input_ids=_tbo_pad_rows(input_ids[rows], padded),
+                    tbo_subbatch_index=idx,
+                )
+            )
+        outputs = execute_overlapped_operations(
+            inputs_arr=inputs_arr,
+            operations_arr=[operations, operations],
+            delta_stages=[0, 0],
+        )
+        set_dp_buffer_len_from_batch(forward_batch)
+        _tbo_hand_back_attn_state(forward_batch)
+        num_rows = hidden_states.shape[0]
+        return (
+            _tbo_merge_rows(children, [o["hidden_states"] for o in outputs], num_rows),
+            _tbo_merge_rows(children, [o["prev_pre"] for o in outputs], num_rows),
         )
 
     def _forward_layers_tbo(
@@ -4285,52 +4647,8 @@ class DeepseekV4Model(nn.Module):
             for idx, child in enumerate(forward_batch.tbo_children)
         ]
 
-        # Non-EP DP TP-MoE: the per-ubatch DP gather/combine (op_gather/op_combine)
-        # needs each ubatch's per-rank token counts, but tbo_padded_len is computed
-        # per-rank locally (not synced). All-gather both ubatches' padded lengths
-        # once across DP ranks, then populate each child's global_num_tokens +
-        # global_dp_buffer_len so the gatherv/reduce_scatterv buffers size correctly.
         if get_moe_a2a_backend().is_none() and get_parallel().attn_dp_size > 1:
-            tp_group = get_parallel().tp_group
-            world = tp_group.world_size
-            children = forward_batch.tbo_children
-            local_lens = torch.tensor(
-                [int(c.tbo_padded_len) for c in children],
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
-            gathered = torch.empty(
-                (world, local_lens.shape[0]),
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
-            tp_group.all_gather_into_tensor(gathered, local_lens)
-            gathered_cpu = gathered.tolist()
-            rank = tp_group.rank_in_group
-            for idx, child in enumerate(children):
-                sizes = [gathered_cpu[r][idx] for r in range(world)]
-                child.global_num_tokens_cpu = sizes
-                child.global_num_tokens_gpu = gathered[:, idx].contiguous()
-                child.global_dp_buffer_len = sum(sizes)
-                # Gather the ubatch's input_ids -> global ONCE here (cached on the
-                # child) instead of per-layer in op_gather_a. The hash MoE reads
-                # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
-                # VARYING size (-> RCCL registers a new internal buffer per size ->
-                # HSA_STATUS_ERROR_OUT_OF_RESOURCES) collapses to 1 per ubatch.
-                local_ids = child.input_ids
-                rows = sizes[rank]
-                if local_ids.shape[0] < rows:
-                    padded_ids = local_ids.new_zeros((rows,))
-                    padded_ids[: local_ids.shape[0]] = local_ids
-                elif local_ids.shape[0] > rows:
-                    padded_ids = local_ids[:rows]
-                else:
-                    padded_ids = local_ids
-                gids = torch.empty(
-                    (sum(sizes),), dtype=local_ids.dtype, device=local_ids.device
-                )
-                tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
-                child._tbo_global_input_ids = gids
+            _tbo_prepare_dp_children(forward_batch, hidden_states.device)
 
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
@@ -4403,7 +4721,10 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        # The V4.1 TBO span ends before the DSpark capture layers.
+        run_tbo = self._can_run_tbo(forward_batch) and (
+            self.hc_pre_from_prev_sublayer or not capture_dspark
+        )
 
         if _is_npu and not run_tbo:
             # Rope cos/sin for the whole forward: one bf16 gather per rope
@@ -4421,7 +4742,6 @@ class DeepseekV4Model(nn.Module):
         last_pre = None
         tail = None
         if self.hc_pre_from_prev_sublayer:
-            assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
                 positions,
                 hidden_states,
@@ -4430,6 +4750,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                run_tbo=run_tbo,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is

@@ -541,6 +541,9 @@ class MoeFlags(_FlagGroupBase):
     deepep_mode: Any = None
     deepep_config: str | None = None
     tbo_enabled: bool | None = None
+    # Set by models whose TBO strategy covers only prefill: decode and
+    # target-verify batches are neither split nor graph-captured split.
+    tbo_prefill_only: bool | None = None
     sbo_enabled: bool | None = None
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None

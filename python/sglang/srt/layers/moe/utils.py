@@ -646,6 +646,14 @@ def is_tbo_enabled() -> bool:
     return moe.tbo_enabled
 
 
+def is_tbo_prefill_only() -> bool:
+    return bool(get_flags().moe.tbo_prefill_only)
+
+
+def set_tbo_prefill_only() -> None:
+    get_flags().moe.tbo_prefill_only = True
+
+
 def is_sbo_enabled() -> bool:
     moe = get_flags().moe
     if moe.sbo_enabled is None:

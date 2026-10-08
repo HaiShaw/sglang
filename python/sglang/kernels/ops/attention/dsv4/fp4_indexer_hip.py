@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4_row,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -172,6 +173,10 @@ def logits_rows_per_chunk(page_table: torch.Tensor, page_table_bucket: int = 4) 
     return max(1, _LOGITS_BUDGET_ELEMS // width)
 
 
+# Prefill logits in bf16 halve the rectangle the scorer writes and top-k / publish read back.
+_PREFILL_LOGITS_BF16 = envs.SGLANG_DSV41_PREFILL_LOGITS_BF16.get()
+
+
 def _alloc_logits(
     num_tokens: int, max_seq_len: int, device: torch.device, is_decode: bool
 ) -> torch.Tensor:
@@ -193,19 +198,18 @@ def _alloc_logits(
     pooled block mid-capture would hand out graph-pool memory to later replays.
     """
     n = num_tokens * max_seq_len
+    dtype = torch.bfloat16 if _PREFILL_LOGITS_BF16 and not is_decode else torch.float32
     if (
         is_decode
         or n > _LOGITS_BUDGET_ELEMS
         or torch.cuda.is_current_stream_capturing()
     ):
-        return torch.empty(
-            (num_tokens, max_seq_len), dtype=torch.float32, device=device
-        )
+        return torch.empty((num_tokens, max_seq_len), dtype=dtype, device=device)
     buf = _LOGITS_POOL.get(device)
     if buf is None:
         buf = torch.empty(_LOGITS_BUDGET_ELEMS, dtype=torch.float32, device=device)
         _LOGITS_POOL[device] = buf
-    return buf[:n].view(num_tokens, max_seq_len)
+    return buf.view(dtype)[:n].view(num_tokens, max_seq_len)
 
 
 def prepare_fp4_decode_workspace(

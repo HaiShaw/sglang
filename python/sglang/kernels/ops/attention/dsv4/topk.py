@@ -29,7 +29,7 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module():
+def _jit_topk_v2_module(bf16_scores: bool = False):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
@@ -37,7 +37,7 @@ def _jit_topk_v2_module():
 
     args = make_cpp_args(is_arch_support_pdl())
     # Enable each cluster path only when its occupancy probe reports capacity.
-    extra_cuda_cflags = []
+    extra_cuda_cflags = ["-DSGL_TOPK_BF16"] if bf16_scores else []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:
@@ -59,7 +59,7 @@ def _jit_topk_v2_module():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
         wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
-        make_name("topk_v2"),
+        make_name("topk_v2_bf16" if bf16_scores else "topk_v2"),
         *args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
@@ -269,7 +269,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(scores.dtype == torch.bfloat16)
     module.topk_transform_paged(
         scores,
         seq_lens,

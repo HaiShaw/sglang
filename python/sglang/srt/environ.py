@@ -1600,6 +1600,9 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # gfx950 V4.1 prefill indexer: bf16 logits from the FP4 scorer (bitwise the fp32 sum rounded to
+    # bf16) halve the rectangle top-k / publish read; needs aiter's out_bf16 scorer. Decode stays fp32.
+    SGLANG_DSV41_PREFILL_LOGITS_BF16 = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

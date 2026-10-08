@@ -74,7 +74,7 @@ struct PageTransform {
 };
 
 struct TopKPagedParams {
-  const float* __restrict__ scores;
+  const device::topk::score_t* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
@@ -120,7 +120,7 @@ struct TopKPagedParams {
 };
 
 struct TopKRaggedParams {
-  float* __restrict__ scores;  // NOTE: may write
+  device::topk::score_t* __restrict__ scores;  // NOTE: may write
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ row_starts;
   const int32_t* __restrict__ out_offsets;
@@ -268,7 +268,7 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
  */
 struct TopKPackedParams {
   // NOTE: may write. The head of the window is masked in place, see the kernel.
-  float* __restrict__ scores;
+  device::topk::score_t* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;      // per-row window length
   const int32_t* __restrict__ row_starts;    // per-row score column offset
   const int32_t* __restrict__ row_to_batch;  // per-row page-table row; null => identity
@@ -1000,7 +1000,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<device::topk::score_t>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -1063,7 +1063,7 @@ struct TopKKernel {
     };
 
     const auto params = TopKPagedParams{
-        .scores = static_cast<const float*>(scores.data_ptr()),
+        .scores = static_cast<const device::topk::score_t*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
@@ -1193,7 +1193,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<device::topk::score_t>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -1222,7 +1222,7 @@ struct TopKKernel {
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
     const auto params = TopKRaggedParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
+        .scores = static_cast<device::topk::score_t*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .row_starts = row_starts_ptr,
         .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
@@ -1266,7 +1266,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<device::topk::score_t>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -1306,7 +1306,7 @@ struct TopKKernel {
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
     const auto params = TopKPackedParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
+        .scores = static_cast<device::topk::score_t*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
         .row_to_batch = row_to_batch_ptr,

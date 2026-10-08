@@ -44,6 +44,17 @@ namespace sglang {
 
 namespace device::topk {
 
+// Score element type. SGL_TOPK_BF16 builds a variant that reads bf16 scores (16-byte vectors of 8);
+// every comparison, histogram bin and tie value is still computed in fp32.
+#ifdef SGL_TOPK_BF16
+using score_t = bf16_t;
+inline constexpr uint32_t kScoreVecSize = 8;
+#else
+using score_t = float;
+inline constexpr uint32_t kScoreVecSize = 4;
+#endif
+
+
 /// Hints that `value` is warp-uniform so it can live in a uniform register. The
 /// caller must already guarantee that: on ROCm this is the identity, since the
 /// 32-bit mask below covers only half of a 64-lane wavefront and there is no
@@ -171,7 +182,7 @@ struct alignas(8) TieValue {
 // ---------------------------------------------------------------------------
 
 struct TopKProblem {
-  const float* __restrict__ in;
+  const score_t* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
@@ -413,10 +424,10 @@ struct TopKConfig {
 template <uint32_t kHistBits_>
 struct TopKRadixBase : TopKConfig {
  public:
-  static constexpr uint32_t kVecSize = 4;
+  static constexpr uint32_t kVecSize = kScoreVecSize;
   static constexpr uint32_t kHistBits = kHistBits_;
   static constexpr uint32_t kHistSize = 1 << kHistBits;
-  using vec_t = AlignedVector<float, kVecSize>;
+  using vec_t = AlignedVector<score_t, kVecSize>;
 
   struct Smem {
     uint32_t count_eq;
@@ -439,7 +450,7 @@ struct TopKRadixBase : TopKConfig {
 
  protected:
   template <uint32_t N = 1, typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  SGL_DEVICE static void for_each_input(const score_t* __restrict__ in, uint32_t seq_len, F&& fn) {
     constexpr auto kStride = N * kBlockSize;
     const auto tx = threadIdx.x;
     const auto num_full = seq_len / kVecSize;  // fully-in-bounds vectors
@@ -457,7 +468,7 @@ struct TopKRadixBase : TopKConfig {
         const auto base = (vi - kStride) * kVecSize;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
-          fn(cur[j], base + j);
+          fn(static_cast<float>(cur[j]), base + j);
         }
       } while (vi < num_full);
     }
@@ -469,7 +480,7 @@ struct TopKRadixBase : TopKConfig {
       cur.load(in, vi);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
-        if (base + j < seq_len) fn(cur[j], base + j);
+        if (base + j < seq_len) fn(static_cast<float>(cur[j]), base + j);
       }
     }
   }
@@ -570,12 +581,12 @@ struct TopKRegister : TopKRadixBase<12> {
       if (vi == num_full - 1) {
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
-          if (j >= tail_start) local_vecs[i][j] = padding_value();
+          if (j >= tail_start) local_vecs[i][j] = static_cast<score_t>(padding_value());
         }
       }
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
-        atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+        atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(static_cast<float>(local_vecs[i][j]))], 1);
       }
     }
     const auto num_padding = kVecSize - tail_start + problem.input_start;
@@ -607,7 +618,7 @@ struct TopKRegister : TopKRadixBase<12> {
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         const auto idx = base + j;
-        const auto val = local_vecs[i][j];
+        const float val = static_cast<float>(local_vecs[i][j]);
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {

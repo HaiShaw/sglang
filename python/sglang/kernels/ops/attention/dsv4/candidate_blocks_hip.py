@@ -25,7 +25,7 @@ def topk_transform_paged_hip(
     raw_indices: Optional[torch.Tensor],
 ) -> None:
     """topk_transform_paged (rows unordered) on the top-k v2 kernel."""
-    assert scores.stride(0) % 4 == 0, "top-k v2 needs 16-byte aligned score rows"
+    assert scores.stride(0) * scores.element_size() % 16 == 0, "top-k v2 needs 16-byte aligned score rows"
     topk_transform_paged_v2(
         scores,
         seq_lens,
@@ -54,6 +54,9 @@ def topk_transform_paged_sorted(
 
 # Candidate blocks one Triton program reduces; times block_size positions of logits.
 _LEVEL_ONE_BLOCKS_PER_PROGRAM = 256
+# The block-score pass is a pure HBM read; 512 blocks x 4 warps is the fastest tile on MI355X.
+_BLOCK_SCORES_PER_PROGRAM = 512
+_BLOCK_SCORES_NUM_WARPS = 4
 
 
 @triton.jit
@@ -83,11 +86,18 @@ def _candidate_block_scores_kernel(
             tl.store(out_ptr + row * out_stride + blocks, float("-inf"), mask=in_table)
         return
     cols = blocks[:, None] * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
-    vals = tl.load(
-        logits_ptr + row * logits_stride + cols,
-        mask=(cols < length) & (cols < width),
-        other=float("-inf"),
-    )
+    row_ptr = logits_ptr + row.to(tl.int64) * logits_stride
+    end = (block0 + BLOCKS_PER_PROGRAM) * BLOCK_SIZE
+    if end <= length and end <= width:
+        # Fully reachable chunk: an unmasked load vectorizes; the masked one is
+        # issued per element and runs at ~half the HBM rate.
+        vals = tl.load(row_ptr + cols).to(tl.float32)
+    else:
+        vals = tl.load(
+            row_ptr + cols,
+            mask=(cols < length) & (cols < width),
+            other=float("-inf"),
+        ).to(tl.float32)
     scores = tl.max(vals, axis=1)
     last = (length - 1) // BLOCK_SIZE
     scores = tl.where(blocks == last, float("inf"), scores)
@@ -134,7 +144,7 @@ def candidate_block_scores(
 ) -> torch.Tensor:
     """[rows, num_blocks] fp32 block maxima of logits over the reachable positions
     (see _candidate_block_scores_kernel). seq_lens int32 [rows], contiguous."""
-    assert logits.dim() == 2 and logits.dtype == torch.float32 and logits.stride(1) == 1
+    assert logits.dim() == 2 and logits.dtype in (torch.float32, torch.bfloat16) and logits.stride(1) == 1
     assert block_size & (block_size - 1) == 0, f"{block_size = } must be a power of 2"
     rows, width = logits.shape
     num_blocks = triton.cdiv(width, block_size)
@@ -144,7 +154,7 @@ def candidate_block_scores(
         dtype=torch.float32,
         device=logits.device,
     )[:, :num_blocks]
-    grid = (rows, triton.cdiv(num_blocks, _LEVEL_ONE_BLOCKS_PER_PROGRAM))
+    grid = (rows, triton.cdiv(num_blocks, _BLOCK_SCORES_PER_PROGRAM))
     _candidate_block_scores_kernel[grid](
         logits,
         seq_lens,
@@ -154,8 +164,9 @@ def candidate_block_scores(
         num_blocks,
         scores.stride(0),
         BLOCK_SIZE=block_size,
-        BLOCKS_PER_PROGRAM=_LEVEL_ONE_BLOCKS_PER_PROGRAM,
+        BLOCKS_PER_PROGRAM=_BLOCK_SCORES_PER_PROGRAM,
         FILL_TAIL=fill_tail,
+        num_warps=_BLOCK_SCORES_NUM_WARPS,
     )
     return scores
 

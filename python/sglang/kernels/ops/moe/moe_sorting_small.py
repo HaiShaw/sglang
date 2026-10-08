@@ -21,7 +21,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
+
+_SMALL_SORT_MAX_PAIRS = envs.SGLANG_AITER_SMALL_MOE_SORT_MAX_PAIRS.get()
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +302,7 @@ def _small_sort_supported(topk_ids, block_size, expert_mask, num_local_tokens):
     return (
         expert_mask is None
         and num_local_tokens is None
-        and m * topk <= 256
+        and m * topk <= min(256, _SMALL_SORT_MAX_PAIRS)
         and topk < 128
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()

@@ -903,6 +903,9 @@ class Envs:
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
     SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    # Max topk_ids.numel() the triton small MoE sort takes over from aiter; measured on gfx950, its
+    # distributed variant (65-256) costs 9.5-14.8 us vs ~6.2 us for aiter multi-phase. 256 = old behavior.
+    SGLANG_AITER_SMALL_MOE_SORT_MAX_PAIRS = EnvInt(64)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone

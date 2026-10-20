@@ -124,8 +124,30 @@ class LagunaMoEGate(nn.Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             requires_grad=False,
         )
+        # [3 * num_experts, hidden] bf16, built after weight loading when
+        # SGLANG_OPT_LAGUNA_ROUTER_BF16X3 is set.
+        self.weight_bf16x3: Optional[torch.Tensor] = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def build_bf16x3(self):
+        # W == P0 + P1 + P2 to ~fp32 precision; stack the parts along N so one
+        # bf16 GEMM reads the (bf16) input once.
+        parts, rest = [], self.weight.data
+        for _ in range(3):
+            part = rest.to(torch.bfloat16)
+            parts.append(part)
+            rest = rest - part.float()
+        self.weight_bf16x3 = torch.cat(parts, dim=0)
+
+    def forward(
+        self, hidden_states: torch.Tensor, use_bf16x3: bool = False
+    ) -> torch.Tensor:
+        if (
+            use_bf16x3
+            and self.weight_bf16x3 is not None
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            out = torch.mm(hidden_states, self.weight_bf16x3.T, out_dtype=torch.float32)
+            return out.view(-1, 3, self.weight.shape[0]).sum(1)
         return F.linear(hidden_states.to(torch.float32), self.weight, None)
 
 
@@ -203,7 +225,13 @@ class LagunaMoE(nn.Module):
 
         shared_out = self.shared_expert(hidden_states)
 
-        router_logits = self.gate(hidden_states)
+        # bf16x3 only pays off at prefill-sized M; small-M decode is weight-read
+        # bound and the 3 bf16 parts are 1.5x the fp32 bytes.
+        router_logits = self.gate(
+            hidden_states,
+            use_bf16x3=forward_batch is not None
+            and forward_batch.forward_mode.is_extend(),
+        )
         if self.router_logit_softcapping > 0.0:
             cap = self.router_logit_softcapping
             router_logits = torch.tanh(router_logits / cap) * cap
@@ -817,6 +845,11 @@ class LagunaForCausalLM(nn.Module):
                 f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
                 f"num_experts={self.config.num_experts}, shards=3)."
             )
+
+        if envs.SGLANG_OPT_LAGUNA_ROUTER_BF16X3.get():
+            for layer in self.model.layers:
+                if isinstance(layer, LagunaDecoderLayer) and layer.is_layer_sparse:
+                    layer.mlp.gate.build_bf16x3()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

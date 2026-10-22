@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -40,7 +41,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -58,6 +60,36 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import LazyValue, add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
+
+
+def _sp_gather_mxfp4(
+    x_shard: torch.Tensor, tp_group, triton_quant: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4-quantize this rank's token shard and all-gather it (prefill SP).
+
+    The quantization is per 1x32 group of one token, so quantize-then-gather
+    equals gather-then-quantize; the gather moves 0.53 B/elt instead of 2.
+    Returns uint8 views (fp4 packed [N, H/2], e8m0 scales [N, H/32])."""
+    from aiter import QuantType, dtypes
+    from aiter.ops.quant import get_hip_quant
+
+    m = x_shard.shape[0]
+    if triton_quant:  # the quantizer of the W4A4 dense linears
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+        q, s = dynamic_mxfp4_quant(x_shard)
+    else:  # the quantizer fused_moe applies to bf16 input
+        q, s = get_hip_quant(QuantType.per_1x32)(
+            x_shard, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+    q = q.view(torch.uint8)[:m]
+    s = s.view(torch.uint8)[:m].contiguous()
+    n = m * tp_group.world_size
+    q_full = q.new_empty((n, q.shape[1]))
+    s_full = s.new_empty((n, s.shape[1]))
+    tp_group.all_gather_into_tensor(q_full, q)
+    tp_group.all_gather_into_tensor(s_full, s)
+    return q_full, s_full
 
 
 class LagunaMLP(nn.Module):
@@ -253,6 +285,57 @@ class LagunaMoE(nn.Module):
         if self._shared_expert_tp1 and adds_replicated_output_to_partial():
             final = final + shared_out
         return final
+
+    def forward_sp(self, x_shard: torch.Tensor, tp_group) -> torch.Tensor:
+        """Prefill SP: ``x_shard`` is this rank's normed token shard. Routes the
+        shard, gathers top-k and the MXFP4 tokens, and returns this rank's
+        partial sum for all tokens (the caller reduce-scatters it)."""
+        router_logits = self.gate(x_shard, use_bf16x3=True)
+        if self.router_logit_softcapping > 0.0:
+            cap = self.router_logit_softcapping
+            router_logits = torch.tanh(router_logits / cap) * cap
+        topk_shard = self.topk(x_shard, router_logits)
+        assert type(topk_shard) is StandardTopKOutput, type(topk_shard)
+        k = topk_shard.topk_ids.shape[1]
+        packed = torch.cat(
+            [
+                topk_shard.topk_weights.float().view(torch.int32),
+                topk_shard.topk_ids.to(torch.int32),
+            ],
+            dim=1,
+        )
+        packed_full = packed.new_empty((packed.shape[0] * tp_group.world_size, 2 * k))
+        tp_group.all_gather_into_tensor(packed_full, packed)
+        topk_output = StandardTopKOutput(
+            topk_weights=packed_full[:, :k].contiguous().view(torch.float32),
+            topk_ids=packed_full[:, k:].contiguous(),
+            router_logits=None,
+        )
+
+        q, s = _sp_gather_mxfp4(x_shard, tp_group)
+        shared_quant = envs.SGLANG_OPT_LAGUNA_PREFILL_SP_SHARED_QUANT.get()
+        if shared_quant == "triton":
+            shared_out = self.shared_expert(
+                _sp_gather_mxfp4(x_shard, tp_group, triton_quant=True)
+            )
+        elif shared_quant == "hip":
+            shared_out = self.shared_expert((q, s))
+        else:
+            raise ValueError(
+                f"SGLANG_OPT_LAGUNA_PREFILL_SP_SHARED_QUANT={shared_quant!r}, "
+                "expected 'triton' or 'hip'"
+            )
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=q.view(torch.float4_e2m1fn_x2),
+            hidden_states_scale=s.view(torch.float8_e8m0fnu),
+            topk_output=topk_output,
+        )
+        routed_out = self.experts.dispatcher.combine(
+            combine_input=self.experts.run_moe_core(dispatch_output)
+        )
+        if self.routed_scaling_factor != 1.0:
+            routed_out = routed_out * self.routed_scaling_factor
+        return routed_out + shared_out
 
 
 class LagunaAttention(nn.Module):
@@ -599,6 +682,9 @@ class LagunaModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self._sp_eligible(forward_batch, positions.shape[0]):
+            return self._sp_forward(input_ids, positions, forward_batch, input_embeds)
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -638,6 +724,81 @@ class LagunaModel(nn.Module):
             return hidden_states
         return hidden_states, aux_hidden_states
 
+    def _sp_supported(self) -> bool:
+        if getattr(self, "_sp_supported_cache", None) is None:
+            parallel = get_parallel()
+            layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+            self._sp_supported_cache = (
+                parallel.tp_size > 1
+                and self.pp_group.world_size == 1
+                and not is_dp_attention_enabled()
+                and parallel.attn_tp_size == parallel.tp_size
+                and not self.layers_to_capture
+                and all(
+                    layer.is_layer_sparse
+                    and not layer.mlp._shared_expert_tp1
+                    and layer.mlp.experts.moe_ep_size == 1
+                    and not layer.mlp.experts.moe_runner_config.apply_router_weight_on_input
+                    for layer in layers
+                )
+            )
+        return self._sp_supported_cache
+
+    def _sp_eligible(self, forward_batch: ForwardBatch, num_tokens: int) -> bool:
+        if not envs.SGLANG_OPT_LAGUNA_PREFILL_SP.get():
+            return False
+        mode = forward_batch.forward_mode
+        return (
+            mode.is_extend()
+            and not mode.is_target_verify()
+            and num_tokens >= envs.SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS.get()
+            and num_tokens % get_parallel().tp_size == 0
+            and self._sp_supported()
+        )
+
+    def _sp_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Prefill with the FFN in sequence-parallel form. Attention is bf16, so
+        its input stays replicated; the o_proj all-reduce becomes an exact bf16
+        reduce-scatter, the post-attention norm and router run on this rank's
+        1/tp token shard, and the MoE gets its tokens as an MXFP4 all-gather.
+        The attention shard is folded into the FFN partial, so one all-reduce
+        per layer returns attn + ffn for every token."""
+        tp = get_parallel().tp_group
+        rank = tp.rank_in_group
+        if not getattr(self, "_sp_logged", False):
+            self._sp_logged = True
+            logger.info(
+                "Laguna prefill SP active (first batch: %d tokens, shared quant %s)",
+                positions.shape[0],
+                envs.SGLANG_OPT_LAGUNA_PREFILL_SP_SHARED_QUANT.get(),
+            )
+        hidden = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        m = hidden.shape[0] // tp.world_size
+        rows = slice(rank * m, (rank + 1) * m)
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        residual = hidden
+        x = layers[0].input_layernorm(hidden)
+        for idx, layer in enumerate(layers):
+            partial = layer.self_attn(
+                positions=positions, hidden_states=x, forward_batch=forward_batch
+            )
+            attn_shard = partial.new_empty((m, partial.shape[1]))
+            tp.reduce_scatter_tensor(attn_shard, partial)
+            x_shard, _ = layer.post_attention_layernorm(attn_shard, residual[rows])
+            partial = layer.mlp.forward_sp(x_shard, tp)
+            partial[rows] += attn_shard
+            summed = tensor_model_parallel_all_reduce(partial)
+            norm = (
+                layers[idx + 1].input_layernorm if idx + 1 < len(layers) else self.norm
+            )
+            x, residual = norm(summed, residual)
+        return x
 
 class LagunaForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False

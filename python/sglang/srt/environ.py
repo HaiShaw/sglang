@@ -757,6 +757,18 @@ class Envs:
     # Laguna: compute the FP32 router GEMM in prefill as bf16 x (3 bf16 parts of
     # the fp32 weight) with fp32 accumulate (~fp32 accuracy, ~3x faster at large M).
     SGLANG_OPT_LAGUNA_ROUTER_BF16X3 = EnvBool(False)
+    # Laguna prefill: replace each TP all-reduce by a bf16 reduce-scatter plus an
+    # all-gather of the already-MXFP4-quantized activations (residual, norms and
+    # router run on 1/tp of the tokens). Extend batches with at least
+    # SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS tokens (multiple of tp) only.
+    SGLANG_OPT_LAGUNA_PREFILL_SP = EnvBool(False)
+    SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS = EnvInt(4096)
+    # Prefill SP: MXFP4 quantizer for the shared expert's gathered tokens.
+    # "triton": the quantizer its W4A4 linear uses on the non-SP path, so its
+    #   input is bit-identical to today (one extra MXFP4 all-gather per layer).
+    # "hip": reuse the routed-MoE (hip) quantization and its single gather;
+    #   faster, but the shared expert sees a differently rounded MXFP4 input.
+    SGLANG_OPT_LAGUNA_PREFILL_SP_SHARED_QUANT = EnvStr("triton")
     # Replicate the input embedding across TP ranks instead of sharding it
     # along the vocab dimension (saves an all-reduce/all-gather in the embed
     # lookup at the cost of replicated embedding weights). Drives both the

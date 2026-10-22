@@ -346,11 +346,26 @@ def pre_permute_standard_to_aiter(
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
+    # Pre-quantized MXFP4 tokens (Laguna sequence-parallel prefill): fused_moe
+    # skips its own activation quant and only sorts the e8m0 scales.
+    a1_scale = None
+    output_dtype = None
+    fp4x2 = getattr(torch, "float4_e2m1fn_x2", None)
+    if (
+        dispatch_output.hidden_states_scale is not None
+        and fp4x2 is not None
+        and hidden_states.dtype == fp4x2
+    ):
+        a1_scale = dispatch_output.hidden_states_scale
+        output_dtype = torch.bfloat16
+
     return AiterRunnerInput(
         hidden_states=hidden_states,
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        a1_scale=a1_scale,
+        output_dtype=output_dtype,
     )
 
 
